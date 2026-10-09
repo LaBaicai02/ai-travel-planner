@@ -1,4 +1,13 @@
-import type { Activity, Currency, Health, Plan } from './types'
+import type { Activity, ApiFailure, Currency, Health, Plan } from './types'
+
+export class ApiError extends Error {
+  readonly details: ApiFailure | undefined
+  constructor(message: string, details?: ApiFailure) {
+    super(message)
+    this.name = 'ApiError'
+    this.details = details
+  }
+}
 
 const currencies = ['CNY', 'USD', 'EUR', 'JPY']
 const record = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -24,10 +33,12 @@ function plan(v: unknown): v is Plan {
     && Number.isInteger(v.travelers) && currencies.includes(String(v.currency))
     && amount(v.budget) && nullableAmount(v.total_cost) && amount(v.known_cost_subtotal)
     && typeof v.notice === 'string' && typeof v.request_id === 'string' && strings(v.warnings)
-    && Array.isArray(v.days) && v.days.length > 0 && v.days.every(d => record(d)
+    && (v.mode !== 'live' || v.currency === 'CNY')
+    && Array.isArray(v.days) && v.days.length > 0 && v.days.length <= 14 && v.days.every(d => record(d)
       && Number.isInteger(d.day) && typeof d.date === 'string' && typeof d.title === 'string'
       && nullableAmount(d.estimated_cost) && amount(d.known_cost_subtotal)
-      && Array.isArray(d.activities) && d.activities.length > 0 && d.activities.every(activity))
+      && Array.isArray(d.activities) && d.activities.length > 0 && d.activities.length <= 12 && d.activities.every(a => activity(a)
+        && (v.mode !== 'live' || (a.sources.length > 0 && a.cost_status !== 'demo'))))
 }
 async function request(path: string, init: RequestInit, timeoutMs: number): Promise<unknown> {
   const controller = new AbortController()
@@ -37,12 +48,16 @@ async function request(path: string, init: RequestInit, timeoutMs: number): Prom
     const data: unknown = await response.json().catch(() => null)
     if (!response.ok) {
       const error = record(data) && record(data.error) ? data.error : null
-      throw new Error(error && typeof error.message === 'string' ? error.message : response.status === 422 ? '输入信息未通过校验，请检查日期、预算及其他字段。' : '生成失败，请稍后重试。')
+      const message = error && typeof error.message === 'string' ? error.message : response.status === 422 ? '输入信息未通过校验，请检查日期、预算及其他字段。' : '生成失败，请稍后重试。'
+      const details = error && typeof error.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code)
+        && typeof error.retryable === 'boolean' && typeof error.request_id === 'string'
+        && /^[a-zA-Z0-9_-]{1,64}$/.test(error.request_id) ? { code: error.code, message, retryable: error.retryable, request_id: error.request_id } : undefined
+      throw new ApiError(message, details)
     }
     return data
   } catch (err) {
-    if (err instanceof Error && err.name === 'AbortError') throw new Error('请求超时，请检查后端服务后重试。')
-    if (err instanceof TypeError) throw new Error('暂时无法连接服务，请确认后端已启动后重试。')
+    if (err instanceof Error && err.name === 'AbortError') throw new ApiError('请求超时，请检查后端服务后重试。')
+    if (err instanceof TypeError) throw new ApiError('暂时无法连接服务，请确认后端已启动后重试。')
     throw err
   } finally { window.clearTimeout(timeout) }
 }

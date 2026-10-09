@@ -16,3 +16,5 @@ export type Health = {
   status: 'ok' | 'unavailable'; mode: Mode; demo: boolean; configured: boolean; ready: boolean
   live_integration_available: boolean; supported_currencies: Currency[]; configuration_issues: string[]; message: string
 }
+
+export type ApiFailure = { code: string; message: string; retryable: boolean; request_id: string }
