@@ -163,7 +163,8 @@ class RepairTests(unittest.IsolatedAsyncioTestCase):
             adapter=ServiceAdapters(SETTINGS,client)
             with self.assertLogs('backend.agent',level='WARNING'),self.assertRaises(ProviderError) as caught:
                 await generate_live(REQUEST,adapter)
-        self.assertIn('source_unknown',caught.exception.message)
+        self.assertIn('OUTPUT_SCHEMA',caught.exception.message)
+        self.assertIn('source_ids',caught.exception.message)
         self.assertNotIn('PRIVATE-VALUE',caught.exception.message)
         self.assertEqual(adapter.budget.counts['model_calls'],4)
 

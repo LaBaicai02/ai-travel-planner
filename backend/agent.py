@@ -6,7 +6,7 @@ from datetime import timedelta
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
 from backend.providers import ProviderError, ServiceAdapters
 from backend.planning_quality import annotate_plan, price_clues
@@ -373,12 +373,56 @@ def _unknown_unverified_facts(output: GeneratedTrip, request: TripRequest,
     return candidate, warnings
 
 
+def _grounded_repair_model(output, request, evidence):
+    """Constrain repair to observed names; no aliases or invented source links."""
+    names = [a.location for d in output.days for a in d.activities]
+    for hit in evidence.values():
+        name = re.sub(r"\s*(?:官方介绍|官方网站|官网|简介|介绍)$", "", hit.title).strip()
+        if len(name) <= 40 and re.search(r"寺|塔|公园|博物馆|景区|风景名胜区|风景区|巷子|古街|餐厅|饭店|酒楼|湖|山|园|楼|馆", name[-6:]) and not re.search(r"攻略|推荐|指南|回答|问答|合集|哪些|哪里|什么|[一二三四五六七八九十百\d]+[家个]", name):
+            names.append(name)
+    candidates = {}
+    for name in dict.fromkeys(names):
+        if len(candidates) >= 60:
+            break
+        ids = [sid for sid, hit in evidence.items() if _compact(name) and _compact(name) in _compact(hit.title + " " + hit.snippet)][:5]
+        if not ids:
+            continue
+        # Use the original place checks, including generic/city rejection.
+        activity = GeneratedActivity(time="09:00 - 10:00", location=name, description="候选地点",
+            estimated_cost=None, cost_status="unknown", cost_basis="", cost_evidence=None,
+            source_ids=ids, opening_hours=None, opening_hours_status="unknown", opening_hours_evidence=None)
+        day = GeneratedDay(day=1, date=request.departure_date.isoformat(), title="候选地点", activities=[activity])
+        try:
+            assemble_trip(GeneratedTrip(days=[day]), request.model_copy(update={"days":1}), evidence, "candidate-check", [])
+        except ProviderError:
+            continue
+        candidates[name] = ids
+    if not candidates:
+        return None, candidates
+    # Alibaba documents enum; emit enum even for one candidate (not const).
+    def location_schema(schema):
+        schema.pop("const", None)
+        schema["enum"] = list(candidates)
+    def sources_schema(schema):
+        schema["items"].pop("const", None)
+        schema["items"]["enum"] = list(evidence)
+    activity_model = create_model("GroundedActivity", __base__=GeneratedActivity,
+        location=(Literal[tuple(candidates)], Field(json_schema_extra=location_schema)),
+        source_ids=(list[Literal[tuple(evidence)]], Field(min_length=1, max_length=5, json_schema_extra=sources_schema)))
+    day_model = create_model("GroundedDay", __base__=GeneratedDay,
+        activities=(list[activity_model], Field(min_length=1, max_length=12)))
+    trip_model = create_model("GroundedTrip", __base__=GeneratedTrip,
+        days=(list[day_model], Field(min_length=1, max_length=14)))
+    return trip_model, candidates
+
+
 async def _generate_segment(request, adapters, evidence, messages, allow_repair):
     """Validate each segment; one repair allowance is shared by the whole trip."""
+    output_model = GeneratedTrip
     for attempt in range(2 if allow_repair else 1):
         result = None
         try:
-            result = await adapters.complete(messages, output_model=GeneratedTrip)
+            result = await adapters.complete(messages, output_model=output_model)
             if not isinstance(result.parsed, GeneratedTrip):
                 raise _output_error()
             candidate, fact_warnings = _unknown_unverified_facts(result.parsed, request, evidence)
@@ -395,6 +439,13 @@ async def _generate_segment(request, adapters, evidence, messages, allow_repair)
                 messages.append(result.message)
             issues = _repair_issues(result.parsed, request, evidence, exc) if result is not None and isinstance(result.parsed, GeneratedTrip) else []
             feedback = " 本轮逐项检查：" + json.dumps(issues, ensure_ascii=False) if issues else ""
+            if result is not None and isinstance(result.parsed, GeneratedTrip):
+                constrained, candidates = _grounded_repair_model(result.parsed, request, evidence)
+                if constrained is not None:
+                    output_model = constrained
+                    feedback += " 只能选择以下已通过名称匹配的候选地点，不改写名称；对应来源 ID 为：" + json.dumps(candidates, ensure_ascii=False)
+                elif any(issue["check"] in {"location_unsupported", "location_generic"} for issue in issues):
+                    raise ProviderError("search", "INSUFFICIENT_EVIDENCE", "检索资料与模型地点无法匹配，且没有可用的已校验候选地点；已停止继续修复，请调整检索条件。", True) from None
             specific = ""
             if any(issue["check"] in {"cost_quote_missing", "cost_price_missing", "reference_price_mismatch", "cost_zero_unsupported"} for issue in issues):
                 specific = " 对失败活动重新检查价格原文；无法在对应地点来源中确认时，将 estimated_cost、cost_evidence 设 null，cost_status 设 unknown，cost_basis 设空字符串。不要只改引文措辞或自行推算价格。"

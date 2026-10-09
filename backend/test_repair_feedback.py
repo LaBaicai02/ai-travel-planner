@@ -110,7 +110,9 @@ class FeedbackRoundtripTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.MockTransport(fixture.handle)) as client:
             with self.assertLogs('backend.agent',level='WARNING'),self.assertRaises(ProviderError) as caught:
                 await generate_live(REQUEST,ServiceAdapters(settings,client,budget))
-        self.assertEqual(caught.exception.validation_reason,'location_unsupported')
+        self.assertEqual(caught.exception.code,'INVALID_MODEL_OUTPUT')
+        self.assertIn('OUTPUT_SCHEMA',caught.exception.message)
+        self.assertIn('location',caught.exception.message)
         self.assertEqual(budget.counts['model_calls'],3)
         self.assertNotIn('PRIVATE-UNSUPPORTED-PLACE',caught.exception.message)
 
