@@ -273,6 +273,50 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
     return assemble_trip(GeneratedTrip(days=combined), request, evidence, budget.request_id, warnings)
 
 
+def _repair_issues(output: GeneratedTrip, request: TripRequest, evidence: dict,
+                   first_error: ProviderError) -> list[dict[str, str]]:
+    """Bounded, value-free diagnostics; never changes the candidate or evidence."""
+    issues, seen = [], set()
+
+    def add(error, day_index=None, activity_index=None):
+        reason = getattr(error, "validation_reason", None)
+        field = getattr(error, "validation_field", None)
+        if reason not in VALIDATION_HINTS or not field or len(issues) >= 20:
+            return
+        if activity_index is not None:
+            field = field.replace("days.0.activities.0", f"days.{day_index}.activities.{activity_index}", 1)
+        elif day_index is not None:
+            field = field.replace("days.0", f"days.{day_index}", 1)
+        key = (reason, field)
+        if key not in seen:
+            seen.add(key)
+            issues.append({"check": reason, "field": field, "hint": VALIDATION_HINTS[reason]})
+
+    add(first_error)
+    for index, day in enumerate(output.days[:request.days]):
+        if len(issues) >= 20:
+            break
+        if day.day != index + 1:
+            add(_output_error("day_number", f"days.{index}.day"))
+        part = request.model_copy(update={"days": 1, "departure_date": request.departure_date + timedelta(days=index)})
+        probe_day = day.model_copy(update={"day": 1})
+        try:
+            assemble_trip(GeneratedTrip(days=[probe_day]), part, evidence, "repair-check", [])
+        except ProviderError as error:
+            add(error, index)
+        for activity_index, activity in enumerate(day.activities):
+            if len(issues) >= 20:
+                break
+            # Isolate each activity so an earlier price error cannot hide later bad sources.
+            probe_day = day.model_copy(update={"day": 1, "date": part.departure_date.isoformat(),
+                                              "activities": [activity]})
+            try:
+                assemble_trip(GeneratedTrip(days=[probe_day]), part, evidence, "repair-check", [])
+            except ProviderError as error:
+                add(error, index, activity_index)
+    return issues
+
+
 async def _generate_segment(request, adapters, evidence, messages, allow_repair):
     """Validate each segment; one repair allowance is shared by the whole trip."""
     for attempt in range(2 if allow_repair else 1):
@@ -292,8 +336,10 @@ async def _generate_segment(request, adapters, evidence, messages, allow_repair)
             if result is not None and isinstance(result.parsed, GeneratedTrip):
                 # Retain only in request memory and the model conversation, never logs.
                 messages.append(result.message)
+            issues = _repair_issues(result.parsed, request, evidence, exc) if result is not None and isinstance(result.parsed, GeneratedTrip) else []
+            feedback = " 本轮逐项检查：" + json.dumps(issues, ensure_ascii=False) if issues else ""
             specific = ""
-            if getattr(exc, "validation_reason", "") in {"cost_quote_missing", "cost_price_missing", "reference_price_mismatch", "cost_zero_unsupported"}:
+            if any(issue["check"] in {"cost_quote_missing", "cost_price_missing", "reference_price_mismatch", "cost_zero_unsupported"} for issue in issues):
                 specific = " 对失败活动重新检查价格原文；无法在对应地点来源中确认时，将 estimated_cost、cost_evidence 设 null，cost_status 设 unknown，cost_basis 设空字符串。不要只改引文措辞或自行推算价格。"
-            messages.append({"role": "user", "content": "后端校验反馈：" + exc.message + specific + " 请重新依据已有资料输出完整 JSON，必须提供 Schema 中所有必填字段。金额为两位小数字符串，未知必须显式填 null；cost_basis 未知时填空字符串。核对日期、天数、时间顺序、已登记来源 ID、地点原文、费用和营业时间证据。无法证实的费用及营业时间设为未知。不得调用工具。"})
+            messages.append({"role": "user", "content": "后端校验反馈：" + exc.message + feedback + specific + " 请重新依据已有资料输出完整 JSON，必须提供 Schema 中所有必填字段。金额为两位小数字符串，未知必须显式填 null；cost_basis 未知时填空字符串。核对日期、天数、时间顺序、已登记来源 ID、地点原文、费用和营业时间证据。无法证实的费用及营业时间设为未知。逐项修复全部检查，不要修改已经有来源支持的地点名称；删除无法获得具体地点证据的活动，仍需每天至少一项有证据的活动，否则不能生成成功行程。不得调用工具。"})
     raise AssertionError("unreachable")
