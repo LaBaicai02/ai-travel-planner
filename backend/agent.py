@@ -267,7 +267,8 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
                         "instructions": "只生成 segment_request 日期范围，day 从 1 开始。优先避免重复已有地点。每天合理安排，描述简短，不为凑数量添加活动。"}
         segment_messages = messages + [{"role": "user", "content": OUTPUT_RULES},
                                       {"role": "user", "content": json.dumps(instructions, ensure_ascii=False)}]
-        parsed, repaired = await _generate_segment(part, adapters, evidence, segment_messages, not repair_used)
+        parsed, repaired, fact_warnings = await _generate_segment(part, adapters, evidence, segment_messages, not repair_used)
+        warnings.extend((f"第 {offset + 1}–{offset + part.days} 天：" + warning) if chunk_count > 1 else warning for warning in fact_warnings)
         repair_used = repair_used or repaired
         combined.extend(day.model_copy(update={"day": offset + index + 1}) for index, day in enumerate(parsed.days))
     return assemble_trip(GeneratedTrip(days=combined), request, evidence, budget.request_id, warnings)
@@ -317,6 +318,47 @@ def _repair_issues(output: GeneratedTrip, request: TripRequest, evidence: dict,
     return issues
 
 
+def _unknown_unverified_facts(output: GeneratedTrip, request: TripRequest,
+                              evidence: dict) -> tuple[GeneratedTrip, list[str]]:
+    """Project unsupported optional facts to explicit unknowns, never invent evidence.
+
+    Structural, place and source errors remain fatal. The strict assembler is still
+    applied to the complete candidate after this projection.
+    """
+    candidate = output.model_copy(deep=True)
+    counts = {"cost": 0, "hours": 0}
+    cost_checks = {"cost_quote_missing", "cost_zero_unsupported", "cost_price_missing", "reference_price_mismatch"}
+    for index, day in enumerate(candidate.days):
+        part = request.model_copy(update={"days": 1, "departure_date": request.departure_date + timedelta(days=index)})
+        for activity in day.activities:
+            for _ in range(3):  # Cost and hours may each need one projection.
+                probe = day.model_copy(update={"day": 1, "date": part.departure_date.isoformat(), "activities": [activity]})
+                try:
+                    assemble_trip(GeneratedTrip(days=[probe]), part, evidence, "fact-check", [])
+                    break
+                except ProviderError as error:
+                    reason = getattr(error, "validation_reason", "")
+                    if reason in cost_checks:
+                        activity.estimated_cost = None
+                        activity.cost_status = "unknown"
+                        activity.cost_basis = ""
+                        activity.cost_evidence = None
+                        counts["cost"] += 1
+                    elif reason == "hours_quote_missing":
+                        activity.opening_hours = None
+                        activity.opening_hours_status = "unknown"
+                        activity.opening_hours_evidence = None
+                        counts["hours"] += 1
+                    else:
+                        break
+    warnings = []
+    if counts["cost"]:
+        warnings.append(f"有 {counts['cost']} 项模型费用未通过来源证据校验，已标为未知；未知不代表免费，请出行前核实。")
+    if counts["hours"]:
+        warnings.append(f"有 {counts['hours']} 项模型营业时间未通过来源证据校验，已标为未知，请出行前向官方核实。")
+    return candidate, warnings
+
+
 async def _generate_segment(request, adapters, evidence, messages, allow_repair):
     """Validate each segment; one repair allowance is shared by the whole trip."""
     for attempt in range(2 if allow_repair else 1):
@@ -325,8 +367,9 @@ async def _generate_segment(request, adapters, evidence, messages, allow_repair)
             result = await adapters.complete(messages, output_model=GeneratedTrip)
             if not isinstance(result.parsed, GeneratedTrip):
                 raise _output_error()
-            assemble_trip(result.parsed, request, evidence, adapters.budget.request_id, [])
-            return result.parsed, attempt == 1
+            candidate, fact_warnings = _unknown_unverified_facts(result.parsed, request, evidence)
+            assemble_trip(candidate, request, evidence, adapters.budget.request_id, [])
+            return candidate, attempt == 1, fact_warnings
         except ProviderError as exc:
             if hasattr(exc, "validation_reason"):
                 logger.warning("request_id=%s error_code=INVALID_MODEL_OUTPUT phase=ITINERARY_VALIDATION check=%s fields=%s counts=%s",

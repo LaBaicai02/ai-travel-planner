@@ -220,7 +220,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trip.days[-1].date,REQUEST.departure_date+timedelta(days=13))
         self.assertEqual(budget.counts['model_calls'],4)
 
-    async def test_overlapping_times_and_fake_reference_prices_rejected(self):
+    async def test_overlapping_times_rejected_and_unverified_prices_unknown(self):
         def overlap(output):
             output['days'][0]['activities'] *= 2
             return output
@@ -232,10 +232,15 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             a=output['days'][0]['activities'][0]
             a.update(estimated_cost='100.00',cost_status='estimated',cost_basis='估算',cost_evidence='门票免费')
             return output
-        for invalid in [overlap,fake_price,unrelated_price]:
-            with self.subTest(invalid=invalid),self.assertRaises(ProviderError) as caught:
-                await self.execute(Fixture(outputs=[invalid,invalid]))
-            self.assertEqual(caught.exception.code,'INVALID_MODEL_OUTPUT')
+        with self.assertRaises(ProviderError) as caught:
+            await self.execute(Fixture(outputs=[overlap,overlap]))
+        self.assertEqual(caught.exception.code,'INVALID_MODEL_OUTPUT')
+        for invalid in [fake_price,unrelated_price]:
+            with self.subTest(invalid=invalid):
+                trip,_=await self.execute(Fixture(outputs=[invalid]))
+                self.assertIsNone(trip.days[0].activities[0].estimated_cost)
+                self.assertEqual(trip.days[0].activities[0].cost_status,'unknown')
+                self.assertTrue(any('未通过来源证据校验' in w for w in trip.warnings))
 
     async def test_outer_timeout_cancels_upstream(self):
         cancelled=asyncio.Event()

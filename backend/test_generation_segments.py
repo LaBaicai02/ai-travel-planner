@@ -92,19 +92,18 @@ class SegmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.code,'TOTAL_TIMEOUT')
         self.assertEqual(budget.counts['model_http_attempts'],2)
 
-    async def test_price_repair_explicitly_requests_unknown_fields(self):
+    async def test_unverified_price_becomes_unknown_without_paid_repair(self):
         def wrong(output):
             output['days'][0]['activities'][0].update(estimated_cost='80.00',cost_status='reference',
                 cost_basis='来源参考价',cost_evidence='原文没有的价格80元')
             return output
         fixture=Fixture(outputs=[wrong])
-        with self.assertLogs('backend.agent',level='WARNING'):
-            trip,_=await self.run_fixture(fixture,days=1)
-        feedback=fixture.requests[-1][1]['messages'][-1]['content']
-        for field in ('estimated_cost','cost_evidence','cost_status','cost_basis'):
-            self.assertIn(field,feedback)
+        trip,budget=await self.run_fixture(fixture,days=1)
         self.assertIsNone(trip.total_cost)
         self.assertEqual(trip.days[0].activities[0].cost_status,'unknown')
+        self.assertTrue(any('未通过来源证据校验' in w for w in trip.warnings))
+        self.assertEqual(budget.counts['model_calls'],3)  # Two search decisions plus generation.
+        self.assertEqual(len([b for _,b in fixture.requests if 'response_format' in b]),1)
 
 
 if __name__ == '__main__': unittest.main()
