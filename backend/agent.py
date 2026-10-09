@@ -1,5 +1,6 @@
 """Bounded native tool-calling workflow. Search text is evidence, never instructions."""
 import json
+import logging
 import re
 from datetime import timedelta
 from decimal import Decimal
@@ -9,6 +10,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from backend.providers import ProviderError, ServiceAdapters
 from backend.schemas import Activity, DayPlan, Source, TripRequest, TripResponse
+
+
+logger = logging.getLogger(__name__)
 
 
 class StrictOutput(BaseModel):
@@ -74,28 +78,58 @@ def _compact(value: str) -> str:
     return re.sub(r"\s+", "", value).casefold()
 
 
-def _output_error():
-    return ProviderError("model", "INVALID_MODEL_OUTPUT", "生成的行程未通过日期、来源、时间或费用校验。")
+VALIDATION_HINTS = {
+    "unexpected_output": "模型返回的数据类型或工具调用顺序无效。",
+    "day_count": "行程天数必须与请求一致。",
+    "day_number": "每日序号必须从 1 开始连续排列。",
+    "day_date": "日期必须从请求出发日期开始连续排列。",
+    "source_unknown": "仅可引用搜索结果中已经登记的来源 ID。",
+    "location_unsupported": "地点名称必须原样出现于引用来源的标题或摘要。",
+    "time_invalid": "时间须为有效的 HH:MM - HH:MM，结束晚于开始且活动不可重叠。",
+    "cost_status_mismatch": "未知费用必须为 null 且状态为 unknown；有金额须为 reference 或 estimated。",
+    "cost_basis_missing": "有金额时必须说明全体旅客人数、计算方式及依据。",
+    "cost_quote_missing": "费用依据须原样出现在该地点的引用来源中，无法证实则标未知。",
+    "cost_zero_unsupported": "零费用必须有免费、免票或零元的来源依据。",
+    "cost_price_missing": "有金额须有明确的元或人民币符号价格依据，无法证实则标未知。",
+    "reference_price_mismatch": "来源参考价须匹配原文金额或按旅客人数计算，不能任意填写。",
+    "cost_unknown_with_quote": "费用未知时 cost_evidence 应为 null。",
+    "hours_status_mismatch": "营业时间未知须为 null 且状态 unknown；有时间须为 reported。",
+    "hours_quote_missing": "营业时间和证据必须来自该地点的引用原文，无法证实则标未知。",
+    "hours_unknown_with_quote": "营业时间未知时 opening_hours_evidence 应为 null。",
+    "activity_contract": "活动费用、依据和营业时间状态须符合公开数据契约。",
+}
+
+
+def _output_error(reason="unexpected_output", field="root"):
+    error = ProviderError("model", "INVALID_MODEL_OUTPUT",
+                          "行程校验失败（ITINERARY_VALIDATION；检查：" + reason + "；字段：" + field + "）。" + VALIDATION_HINTS[reason])
+    # These diagnostics are created only from backend-owned labels and indices.
+    error.validation_reason, error.validation_field = reason, field
+    return error
 
 
 def assemble_trip(output: GeneratedTrip, request: TripRequest, evidence: dict,
                   request_id: str, warnings: list[str]) -> TripResponse:
     if len(output.days) != request.days:
-        raise _output_error()
+        raise _output_error("day_count", "days")
     days = []
     for index, item in enumerate(output.days):
+        day_path = f"days.{index}"
         expected_date = request.departure_date + timedelta(days=index)
-        if item.day != index + 1 or item.date != expected_date.isoformat():
-            raise _output_error()
+        if item.day != index + 1:
+            raise _output_error("day_number", day_path + ".day")
+        if item.date != expected_date.isoformat():
+            raise _output_error("day_date", day_path + ".date")
         activities, previous_end = [], -1
-        for activity in item.activities:
+        for activity_index, activity in enumerate(item.activities):
+            path = day_path + f".activities.{activity_index}"
             if any(s not in evidence for s in activity.source_ids):
-                raise _output_error()
+                raise _output_error("source_unknown", path + ".source_ids")
             hits = [evidence[s] for s in dict.fromkeys(activity.source_ids)]
             location = _compact(activity.location)
             relevant = [h for h in hits if location and location in _compact(h.title + " " + h.snippet)]
             if not relevant:
-                raise _output_error()
+                raise _output_error("location_unsupported", path + ".location")
             text = _compact(" ".join(h.title + " " + h.snippet for h in relevant))
             try:
                 start, end = activity.time.split(" - ")
@@ -109,35 +143,41 @@ def assemble_trip(output: GeneratedTrip, request: TripRequest, evidence: dict,
                     raise ValueError
                 previous_end = end
             except ValueError:
-                raise _output_error() from None
+                raise _output_error("time_invalid", path + ".time") from None
+            if (activity.estimated_cost is None) != (activity.cost_status == "unknown"):
+                raise _output_error("cost_status_mismatch", path + ".cost_status")
             if activity.estimated_cost is not None:
+                if not activity.cost_basis.strip():
+                    raise _output_error("cost_basis_missing", path + ".cost_basis")
                 if not activity.cost_evidence or _compact(activity.cost_evidence) not in text:
-                    raise _output_error()
+                    raise _output_error("cost_quote_missing", path + ".cost_evidence")
                 amount = Decimal(activity.estimated_cost)
                 quote = activity.cost_evidence
                 prices = [Decimal(a or b) for a, b in re.findall(r"[¥￥]\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*元", quote)]
                 free = any(word in quote for word in ("免费", "免票"))
                 if amount == 0 and not free and Decimal("0") not in prices:
-                    raise _output_error()
+                    raise _output_error("cost_zero_unsupported", path + ".estimated_cost")
                 if amount > 0 and not prices:
-                    raise _output_error()
+                    raise _output_error("cost_price_missing", path + ".cost_evidence")
                 if activity.cost_status == "reference" and amount not in prices + [p * request.travelers for p in prices] and not (amount == 0 and free):
-                    raise _output_error()
+                    raise _output_error("reference_price_mismatch", path + ".estimated_cost")
             elif activity.cost_evidence is not None:
-                raise _output_error()
+                raise _output_error("cost_unknown_with_quote", path + ".cost_evidence")
+            if (activity.opening_hours is None) != (activity.opening_hours_status == "unknown"):
+                raise _output_error("hours_status_mismatch", path + ".opening_hours_status")
             if activity.opening_hours is not None:
                 quote = activity.opening_hours_evidence
                 if not quote or _compact(quote) not in text or _compact(activity.opening_hours) not in _compact(quote):
-                    raise _output_error()
+                    raise _output_error("hours_quote_missing", path + ".opening_hours_evidence")
             elif activity.opening_hours_evidence is not None:
-                raise _output_error()
+                raise _output_error("hours_unknown_with_quote", path + ".opening_hours_evidence")
             try:
                 activities.append(Activity(
                     **activity.model_dump(exclude={"source_ids", "cost_evidence", "opening_hours_evidence"}),
                     sources=[Source.model_validate(h.model_dump(include={"id", "title", "url", "retrieved_at"})) for h in hits],
                 ))
             except ValidationError:
-                raise _output_error() from None
+                raise _output_error("activity_contract", path) from None
         days.append(DayPlan(day=index + 1, date=expected_date, title=item.title, activities=activities))
     trip = TripResponse(
         demo=False, mode="live", destination=request.destination, travelers=request.travelers,
@@ -198,13 +238,20 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
         raise ProviderError("search", "INSUFFICIENT_EVIDENCE", "没有获得可用旅行资料，请调整目的地或稍后重试。", True)
     messages.append({"role": "user", "content": OUTPUT_RULES})
     for attempt in range(2):
+        result = None
         try:
             result = await adapters.complete(messages, output_model=GeneratedTrip)
             if not isinstance(result.parsed, GeneratedTrip):
                 raise _output_error()
             return assemble_trip(result.parsed, request, evidence, budget.request_id, warnings)
         except ProviderError as exc:
+            if hasattr(exc, "validation_reason"):
+                logger.warning("request_id=%s error_code=INVALID_MODEL_OUTPUT phase=ITINERARY_VALIDATION check=%s fields=%s counts=%s",
+                               budget.request_id, exc.validation_reason, exc.validation_field, budget.counts)
             if exc.code != "INVALID_MODEL_OUTPUT" or attempt == 1:
                 raise
+            if result is not None and isinstance(result.parsed, GeneratedTrip):
+                # Retain only in request memory and the model conversation, never logs.
+                messages.append(result.message)
             messages.append({"role": "user", "content": "后端校验反馈：" + exc.message + " 请重新依据已有资料输出完整 JSON，必须提供 Schema 中所有必填字段。金额为两位小数字符串，未知必须显式填 null；cost_basis 未知时填空字符串。核对日期、天数、时间顺序、已登记来源 ID、地点原文、费用和营业时间证据。无法证实的费用及营业时间设为未知。不得调用工具。"})
     raise AssertionError("unreachable")
