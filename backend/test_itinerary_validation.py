@@ -29,6 +29,35 @@ class BusinessValidationTests(unittest.TestCase):
         self.assertIn('ITINERARY_VALIDATION',caught.exception.message)
         self.assertNotIn('PRIVATE-VALUE',caught.exception.message)
 
+    def test_generic_places_rejected_even_when_present_in_source(self):
+        for location in (REQUEST.destination, "地道的美食", "附近餐厅", "午餐", "自由活动"):
+            with self.subTest(location=location):
+                output = output_for('s1')
+                output['days'][0]['activities'][0]['location'] = location
+                hit = evidence()['s1'].model_copy(update={'title': location, 'snippet': location})
+                with self.assertRaises(ProviderError) as caught:
+                    assemble_trip(GeneratedTrip.model_validate(output), REQUEST, {'s1': hit}, 'test', [])
+                self.assertEqual(caught.exception.validation_reason, 'location_generic')
+                self.assertEqual(caught.exception.validation_field, 'days.0.activities.0.location')
+
+    def test_named_restaurant_and_district_are_allowed_with_evidence(self):
+        for location in ("九门轩烤鸭店(前门店)", "宽窄巷子"):
+            with self.subTest(location=location):
+                output = output_for('s1')
+                activity = output['days'][0]['activities'][0]
+                activity.update(location=location, estimated_cost=None, cost_status='unknown', cost_basis='',
+                                cost_evidence=None, opening_hours=None, opening_hours_status='unknown',
+                                opening_hours_evidence=None)
+                hit = evidence()['s1'].model_copy(update={'title': location, 'snippet': location})
+                trip = assemble_trip(GeneratedTrip.model_validate(output), REQUEST, {'s1': hit}, 'test', [])
+                self.assertEqual(trip.days[0].activities[0].location, location)
+
+    def test_specific_destination_can_be_its_own_activity(self):
+        request = REQUEST.model_copy(update={'destination': '西湖'})
+        output = GeneratedTrip.model_validate(output_for('s1'))
+        trip = assemble_trip(output, request, evidence(), 'test', [])
+        self.assertEqual(trip.days[0].activities[0].location, '西湖')
+
     def test_day_count_number_date_separate(self):
         for field,value,reason in [('day',2,'day_number'),('date','2027-01-01','day_date')]:
             with self.subTest(field=field):
@@ -76,6 +105,21 @@ class BusinessValidationTests(unittest.TestCase):
 
 
 class RepairTests(unittest.IsolatedAsyncioTestCase):
+    async def test_generic_place_repairs_once_with_specific_feedback(self):
+        def wrong(output):
+            output['days'][0]['activities'][0]['location'] = REQUEST.destination
+            return output
+        fixture = Fixture(outputs=[wrong])
+        async with httpx.AsyncClient(transport=httpx.MockTransport(fixture.handle)) as client:
+            adapter = ServiceAdapters(SETTINGS, client)
+            with self.assertLogs('backend.agent', level='WARNING'):
+                trip = await generate_live(REQUEST, adapter)
+        self.assertNotEqual(trip.days[0].activities[0].location, REQUEST.destination)
+        self.assertIn('location_generic', fixture.requests[-1][1]['messages'][-1]['content'])
+        self.assertNotIn('tools', fixture.requests[-1][1])
+        self.assertEqual(adapter.budget.counts['model_calls'], 4)
+        self.assertEqual(adapter.budget.counts['search_calls'], 1)
+
     async def test_business_repair_sees_previous_output_and_specific_reason(self):
         def wrong(output):
             output['days'][0]['activities'][0]['cost_evidence']='PRIVATE-VALUE'
