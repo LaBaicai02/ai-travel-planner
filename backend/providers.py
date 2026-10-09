@@ -84,6 +84,37 @@ class ModelResult:
     tool_calls: list[ToolCall]
     parsed: BaseModel | None
     usage: dict[str, int]
+    finish_reason: str = "stop"
+
+
+def _schema_fields(schema: dict) -> set[str]:
+    """Only backend-owned field names may appear in validation diagnostics."""
+    fields = set()
+    def visit(value):
+        if isinstance(value, dict):
+            properties = value.get("properties")
+            if isinstance(properties, dict):
+                fields.update(properties)
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+    visit(schema)
+    return fields
+
+
+def _safe_validation_paths(exc: ValidationError, schema: dict) -> str:
+    allowed = _schema_fields(schema)
+    paths = []
+    for error in exc.errors(include_input=False, include_context=False, include_url=False)[:3]:
+        parts = [str(part) if type(part) is int and 0 <= part < 1000 else
+                 part if isinstance(part, str) and part in allowed else "unknown_field"
+                 for part in error["loc"][:8]]
+        path = ".".join(parts) or "root"
+        if path not in paths:
+            paths.append(path)
+    return ", ".join(paths)
 
 
 def _reject_constant(value):
@@ -310,6 +341,9 @@ class ServiceAdapters:
             "model", self.settings.llm_base_url.rstrip("/") + "/chat/completions",
             self.settings.dashscope_api_key.get_secret_value(), payload,
         )
+        phase = "MODEL_PROTOCOL"
+        phase_label = "响应协议"
+        check = "response_choices"
         try:
             choices = body["choices"]
             if not isinstance(choices, list) or len(choices) != 1:
@@ -317,55 +351,86 @@ class ServiceAdapters:
             choice = choices[0]
             message = choice["message"]
             finish = choice["finish_reason"]
+            check = "assistant_role"
             if not isinstance(message, dict) or message.get("role") != "assistant":
                 raise ValueError
             if message.get("refusal") or finish == "content_filter":
                 raise ProviderError("model", "MODEL_REFUSED", "模型拒绝生成此内容。")
             if finish == "length":
                 raise ProviderError("model", "MODEL_TRUNCATED", "模型输出被截断。")
+            check = "finish_reason"
             if finish not in ("stop", "tool_calls"):
                 raise ValueError
             content = message.get("content")
             raw_calls = message.get("tool_calls")
             if raw_calls is None:
                 raw_calls = []
+            check = "content_and_tool_types"
             if not isinstance(raw_calls, list) or (content is not None and not isinstance(content, str)):
                 raise ValueError
             calls, ids = [], set()
             for call in raw_calls:
+                check = "tool_identity"
                 call_id, fn = call["id"], call["function"]
                 if call["type"] != "function" or not isinstance(call_id, str) or not call_id or call_id in ids or fn["name"] not in allowed or tool_choice == "none":
                     raise ValueError
                 if isinstance(tool_choice, dict) and fn["name"] != tool_choice["function"]["name"]:
                     raise ValueError
+                phase, phase_label = "TOOL_ARGUMENT_JSON", "工具参数 JSON"
+                check = "tool_arguments"
                 arguments = _json(fn["arguments"])
                 if not isinstance(arguments, dict):
                     raise ValueError
                 calls.append(ToolCall(call_id, fn["name"], arguments))
                 ids.add(call_id)
+                phase, phase_label = "MODEL_PROTOCOL", "响应协议"
+            # Qwen's official workflow dispatches validated native tool_calls.
+            # A completed response may carry stop together with valid tool calls.
+            # Do not infer tools from text; tool_calls without a payload is still invalid.
+            check = "tool_calls_missing"
             if finish == "tool_calls" and not calls:
                 raise ValueError
+            if finish == "stop" and calls:
+                logger.info("request_id=%s provider=model finish_reason=stop validated_tool_count=%d",
+                            self.budget.request_id, len(calls))
+            check = "forced_tool_missing"
             if isinstance(tool_choice, dict) and not calls:
                 raise ValueError
             if not calls and (content is None or not content.strip()):
                 raise ProviderError("model", "MODEL_EMPTY", "模型返回空内容。")
             parsed = None
             if output_model is not None:
+                check = "structured_tool_conflict"
                 if calls:
                     raise ValueError
+                phase, phase_label = "OUTPUT_JSON", "行程 JSON 解析"
+                check = "output_json"
                 _json(content)
+                phase, phase_label = "OUTPUT_SCHEMA", "行程字段校验"
+                check = "output_schema"
                 parsed = output_model.model_validate_json(content)
+            phase, phase_label = "MODEL_USAGE", "用量字段校验"
+            check = "usage_object"
             usage = body.get("usage")
             if usage is None:
                 usage = {}
             if not isinstance(usage, dict):
                 raise ValueError
-            usage = {k: v for k, v in usage.items()
-                     if k in ("prompt_tokens", "completion_tokens", "total_tokens") and type(v) is int and v >= 0}
+            token_fields = ("prompt_tokens", "completion_tokens", "total_tokens")
+            check = "usage_tokens"
+            if any(k in usage and (type(usage[k]) is not int or usage[k] < 0) for k in token_fields):
+                raise ValueError
+            usage = {k: v for k, v in usage.items() if k in token_fields}
             safe_message = {"role": "assistant", "content": content}
             if calls:
                 safe_message["tool_calls"] = raw_calls
             logger.info("request_id=%s provider=model usage=%s", self.budget.request_id, usage)
-            return ModelResult(safe_message, calls, parsed, usage)
-        except (KeyError, TypeError, ValueError, ValidationError):
-            raise ProviderError("model", "INVALID_MODEL_OUTPUT", "模型输出不符合协议或指定的数据格式。") from None
+            return ModelResult(safe_message, calls, parsed, usage, finish_reason=finish)
+        except (KeyError, TypeError, ValueError, ValidationError) as exc:
+            paths = _safe_validation_paths(exc, output_model.model_json_schema()) if isinstance(exc, ValidationError) and output_model else ""
+            # No str(exc), input values, unknown field names, response bodies or headers.
+            logger.warning("request_id=%s provider=model error_code=INVALID_MODEL_OUTPUT phase=%s check=%s fields=%s counts=%s",
+                           self.budget.request_id, phase, check, paths or "none", self.budget.counts)
+            detail = "；字段：" + paths if paths else ""
+            raise ProviderError("model", "INVALID_MODEL_OUTPUT",
+                                "模型输出校验失败（" + phase_label + " / " + phase + "；检查：" + check + detail + "）。") from None

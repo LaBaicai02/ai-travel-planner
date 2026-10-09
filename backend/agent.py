@@ -206,5 +206,5 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
         except ProviderError as exc:
             if exc.code != "INVALID_MODEL_OUTPUT" or attempt == 1:
                 raise
-            messages.append({"role": "user", "content": "上次输出未通过校验。请重新依据已有资料输出完整 JSON，核对日期、天数、时间顺序、已登记来源 ID、地点原文、费用和营业时间证据。无法证实的费用及营业时间设为未知。不得调用工具。"})
+            messages.append({"role": "user", "content": "后端校验反馈：" + exc.message + " 请重新依据已有资料输出完整 JSON，必须提供 Schema 中所有必填字段。金额为两位小数字符串，未知必须显式填 null；cost_basis 未知时填空字符串。核对日期、天数、时间顺序、已登记来源 ID、地点原文、费用和营业时间证据。无法证实的费用及营业时间设为未知。不得调用工具。"})
     raise AssertionError("unreachable")
