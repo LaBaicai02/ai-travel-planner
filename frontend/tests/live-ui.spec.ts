@@ -111,3 +111,27 @@ test('真实结果拒绝模拟费用、缺少来源及错误币种', async ({ pa
     await expect(page.locator('.day-card')).toHaveCount(0)
   }
 })
+
+
+test('部分活动缺价仍展示行程和已知小计，不把未知当免费', async ({ page }) => {
+  await configureHealth(page)
+  const plan = makePlan()
+  Object.assign(plan, { known_cost_subtotal: '20.00', warnings: ['第1天第1项价格未知，未填默认金额'] })
+  const day = plan.days[0]
+  day.known_cost_subtotal = '20.00'
+  const known = structuredClone(day.activities[0])
+  Object.assign(known, { time: '12:00 - 13:00', location: '测试餐厅', estimated_cost: '20.00',
+    cost_status: 'estimated', cost_basis: '2人，网上人均参考价10元，共20元' })
+  day.activities.push(known)
+  await page.route('**/api/itineraries', route => route.fulfill({ json: plan }))
+  await enterRequest(page)
+  await page.getByRole('button', { name: '生成我的行程' }).click()
+  await expect(page.locator('.activity')).toHaveCount(2)
+  await expect(page.locator('.cost-summary')).toContainText('费用不完整')
+  await expect(page.locator('.known-cost')).toContainText('¥20.00')
+  await expect(page.locator('.activity-cost').nth(0)).toContainText('价格未知')
+  await expect(page.locator('.activity-cost').nth(0)).not.toContainText('¥0.00')
+  await expect(page.locator('.activity-cost').nth(1)).toContainText('估算 ¥20.00')
+  await expect(page.locator('.plan-warnings')).toContainText('未填默认金额')
+  await expect(page.getByRole('alert')).toHaveCount(0)
+})

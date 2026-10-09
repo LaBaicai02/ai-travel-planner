@@ -74,13 +74,73 @@ class CompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(searches,2)
         self.assertTrue(any('超过预算' in w for w in trip.warnings))
 
-    async def test_missing_budget_missing_prices_or_search_failure_never_default(self):
+    async def test_missing_budget_missing_prices_or_search_failure_keep_unknown(self):
         for mode,limit in [('success',1),('missing',2),('timeout',2)]:
-            with self.subTest(mode=mode,limit=limit),self.assertRaises(ProviderError) as caught:
-                await self.run_fixture(followup=mode,limit=limit)
-            self.assertEqual(caught.exception.code,'PRICE_EVIDENCE_MISSING')
-            self.assertIn('第1天第1项',caught.exception.message)
-            self.assertIn('未填默认金额',caught.exception.message)
+            with self.subTest(mode=mode,limit=limit):
+                trip,budget,searches=await self.run_fixture(followup=mode,limit=limit)
+                self.assertIsNone(trip.total_cost)
+                self.assertEqual(trip.known_cost_subtotal,Decimal('0'))
+                activity=trip.days[0].activities[0]
+                self.assertIsNone(activity.estimated_cost)
+                self.assertEqual(activity.cost_status,'unknown')
+                self.assertEqual(activity.cost_basis,'')
+                self.assertTrue(any('第1天第1项' in w for w in trip.warnings))
+                self.assertTrue(any('未填默认金额' in w for w in trip.warnings))
+                self.assertNotIn('每项金额均有',trip.notice)
+                self.assertFalse(trip.demo)
+                self.assertLessEqual(searches,limit)
+                self.assertEqual(budget.counts['model_calls'],2)
+
+    async def test_mixed_costs_preserve_known_subtotal_and_warn_when_over_budget(self):
+        from copy import deepcopy
+        output=output_for('s1')
+        known=deepcopy(output['days'][0]['activities'][0])
+        known.update(time='12:00 - 13:00',estimated_cost='160.00',cost_status='reference',
+                     cost_basis='2人，每人80元',cost_evidence='导览80元/人')
+        output['days'][0]['activities'].append(known)
+        e={'s1':hit('s1','西湖','西湖 导览80元/人。')}
+        trip=assemble_trip(GeneratedTrip.model_validate(output),REQUEST,e,'test',[])
+        settings=SETTINGS.model_copy(update={'max_search_calls':1})
+        budget=CallBudget(settings);budget.counts['search_calls']=1
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r:self.fail('No search budget'))) as client:
+            result=await complete_online_prices(trip,e,ServiceAdapters(settings,client,budget))
+        self.assertIsNone(result.total_cost)
+        self.assertIsNone(result.days[0].estimated_cost)
+        self.assertEqual(result.known_cost_subtotal,Decimal('160.00'))
+        self.assertEqual(result.days[0].activities[1].estimated_cost,Decimal('160.00'))
+        self.assertTrue(any('超过预算' in w for w in result.warnings))
+        self.assertIsNone(trip.days[0].activities[0].estimated_cost)
+
+    async def test_http_endpoint_returns_live_200_without_price_evidence(self):
+        from fastapi.testclient import TestClient
+        from backend.main import create_app
+        fixture=Fixture();original=fixture.handle
+        def handle(request):
+            if request.url.path.endswith('web-search'):
+                body=search_response();body['data']['webPages']['value'][0]['summary']='西湖 风景介绍，无价格资料。'
+                return httpx.Response(200,json=body)
+            return original(request)
+        settings=SETTINGS.model_copy(update={'max_search_calls':1,'max_search_rounds':1})
+        with TestClient(create_app(settings,transport=httpx.MockTransport(handle))) as client:
+            response=client.post('/api/itineraries',json=REQUEST.model_dump(mode='json'))
+        self.assertEqual(response.status_code,200)
+        data=response.json()
+        self.assertEqual(data['mode'],'live')
+        self.assertFalse(data['demo'])
+        self.assertIsNone(data['total_cost'])
+        self.assertEqual(data['known_cost_subtotal'],'0.00')
+        self.assertIsNone(data['days'][0]['activities'][0]['estimated_cost'])
+        self.assertNotIn('error',data)
+
+    async def test_optional_search_retry_attempt_limit_keeps_unknown(self):
+        trip=assemble_trip(GeneratedTrip.model_validate(output_for('s1')),REQUEST,{'s1':hit('s1','西湖','无报价')},'test',[])
+        settings=SETTINGS.model_copy(update={'max_upstream_retries':1,'max_search_http_attempts':1})
+        budget=CallBudget(settings)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r:httpx.Response(500,json={}))) as client:
+            result=await complete_online_prices(trip,{},ServiceAdapters(settings,client,budget))
+        self.assertIsNone(result.total_cost)
+        self.assertEqual(budget.counts['search_http_attempts'],1)
+        self.assertTrue(any('价格定向搜索失败' in w for w in result.warnings))
 
     async def test_auth_failure_remains_explicit(self):
         with self.assertRaises(ProviderError) as caught:await self.run_fixture(followup='auth')

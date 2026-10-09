@@ -25,7 +25,7 @@ def searched_price(activity, hits, travelers):
 
 
 async def complete_online_prices(trip, evidence, adapters):
-    """Successful live responses have all costs; missing evidence fails explicitly.
+    """Enrich live prices when possible; optional missing prices remain unknown.
 
     Follow-up search shares the original deadline and HTTP/logical budgets.
     No model retry or arbitrary default can manufacture price coverage.
@@ -50,7 +50,7 @@ async def complete_online_prices(trip, evidence, adapters):
                         evidence.update({h.id:h for h in search.results})
                         data['warnings'].extend(search.warnings)
                     except ProviderError as exc:
-                        if exc.code in {'AUTH_FAILED','QUOTA_EXHAUSTED','CONFIGURATION_ERROR','TOTAL_TIMEOUT','CALL_LIMIT'}:
+                        if exc.code in {'AUTH_FAILED','QUOTA_EXHAUSTED','CONFIGURATION_ERROR','TOTAL_TIMEOUT'}:
                             raise
                         data['warnings'].append('部分价格定向搜索失败，没有使用默认价格替代。')
                     result = searched_price(activity, evidence.values(), trip.travelers)
@@ -61,15 +61,20 @@ async def complete_online_prices(trip, evidence, adapters):
             activity.update(estimated_cost=price['amount'],cost_status=status,cost_basis=price['basis'])
             price_sources = [Source.model_validate(h.model_dump(include={'id','title','url','retrieved_at'})).model_dump() for h in hits[:5]]
             activity['sources'] = list({s['id']:s for s in activity['sources'] + price_sources}.values())
-    if missing:
-        raise ProviderError('search','PRICE_EVIDENCE_MISSING',
-            '未取得全部活动的网上价格依据（'+ '、'.join(missing[:8]) +
-            ('等' if len(missing)>8 else '') +'）。本次搜索预算内无法完成价格核实；未填默认金额，也未返回不完整总价。请调整活动或后端搜索预算后再试。')
-    data['warnings'] = [w.replace('已标为未知', '原价格暂未确认，现已依据检索价格补齐')
-        if '费用未通过来源证据校验' in w else w for w in data['warnings']
+    # Price coverage is optional; core itinerary/source validation remains strict.
+    data['warnings'] = [w for w in data['warnings']
         if not w.startswith(('部分费用未知，完整总价不可计算','本次搜索摘要没有价格线索'))]
-    data['notice'] += ' 每项金额均有本次网上检索价格依据；总价包含估算，实际以售票处或菜单为准。'
+    if missing:
+        data['warnings'].append('以下活动未取得可用价格依据：' + '、'.join(missing[:8]) +
+            ('等' if len(missing)>8 else '') + '；费用保留未知，未填默认金额。')
+        data['warnings'].append('部分费用未知，完整总价不可计算；已知费用小计不代表全部支出。')
+        data['notice'] += ' 有依据的费用参与已知小计；未知费用不等于免费，完整总价待价格补齐后才能计算。'
+    else:
+        data['warnings'] = [w.replace('已标为未知', '原价格暂未确认，现已依据检索价格补齐')
+            if '费用未通过来源证据校验' in w else w for w in data['warnings']]
+        data['notice'] += ' 每项金额均有本次网上检索价格依据；总价包含估算，实际以售票处或菜单为准。'
+    data['warnings'] = list(dict.fromkeys(data['warnings']))
     result = TripResponse.model_validate(data)
-    if result.total_cost > result.budget and not any('超过预算' in w for w in result.warnings):
-        result.warnings.append('预计活动总费用超过预算，请调整安排；未按预算缩小金额。')
+    if result.known_cost_subtotal > result.budget and not any('超过预算' in w for w in result.warnings):
+        result.warnings.append(('已知活动费用小计' if missing else '预计活动总费用') + '超过预算，请调整安排；未按预算缩小金额。')
     return result

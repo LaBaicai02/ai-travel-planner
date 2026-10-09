@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import httpx
 from backend.agent import GeneratedTrip, SearchArguments, assemble_trip, generate_live
 from backend.planning_quality import annotate_plan, price_clues
-from backend.providers import CallBudget, SearchHit, ServiceAdapters, ProviderError
+from backend.providers import CallBudget, SearchHit, ServiceAdapters
 from backend.test_agent import Fixture, REQUEST, SETTINGS, output_for, tool_response, search_response
 from backend.test_itinerary_validation import evidence
 
@@ -93,9 +93,9 @@ class PriceRoundtripTests(unittest.IsolatedAsyncioTestCase):
         settings=SETTINGS.model_copy(update={'max_search_rounds':1,'max_search_calls':1})
         budget=CallBudget(settings)
         async with httpx.AsyncClient(transport=httpx.MockTransport(fixture.handle)) as client:
-            with self.assertRaises(ProviderError) as caught:
-                await generate_live(REQUEST,ServiceAdapters(settings,client,budget))
-        self.assertEqual(caught.exception.code,'PRICE_EVIDENCE_MISSING')
+            trip=await generate_live(REQUEST,ServiceAdapters(settings,client,budget))
+        self.assertIsNone(trip.total_cost)
+        self.assertTrue(any('未取得可用价格依据' in w for w in trip.warnings))
         self.assertEqual(budget.counts['search_calls'],1)
         self.assertEqual(budget.counts['model_calls'],2)
 

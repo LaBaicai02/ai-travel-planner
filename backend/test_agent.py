@@ -254,7 +254,11 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(10)
                 return {"type": "http.disconnect"}
         settings=SETTINGS.model_copy(update={'trip_timeout_seconds':0.02})
-        with self.assertRaises(ProviderError) as caught:
+        # Isolate the outer deadline: provider timeout behavior has separate tests.
+        # Equal inner/outer timers race on Windows and can legitimately differ.
+        async def slow_generation(trip, adapters):
+            await adapters.client.post('https://model.example/v1/chat/completions')
+        with patch('backend.main.generate_live', slow_generation), self.assertRaises(ProviderError) as caught:
             await run_live(Connected(),REQUEST,settings,'test',httpx.MockTransport(handler))
         self.assertEqual(caught.exception.code,'TOTAL_TIMEOUT')
         self.assertTrue(cancelled.is_set())
