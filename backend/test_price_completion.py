@@ -68,11 +68,14 @@ class CompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(searches,2)
         self.assertEqual(budget.counts['search_calls'],2)
 
-    async def test_same_place_reuses_price_search_and_sums_each_visit(self):
+    async def test_same_day_attraction_deduplicated_before_price_search_and_total(self):
         trip,budget,searches=await self.run_fixture(repeated=True)
-        self.assertEqual(trip.total_cost,Decimal('200.00'))
+        self.assertEqual(trip.total_cost,Decimal('100.00'))
+        self.assertEqual(len(trip.days[0].activities),1)
         self.assertEqual(searches,2)
-        self.assertTrue(any('超过预算' in w for w in trip.warnings))
+        self.assertEqual(budget.counts['model_calls'],2)
+        self.assertFalse(any('超过预算' in w for w in trip.warnings))
+        self.assertTrue(any('重复安排已移除' in w for w in trip.warnings))
 
     async def test_missing_budget_missing_prices_or_search_failure_keep_unknown(self):
         for mode,limit in [('success',1),('missing',2),('timeout',2)]:

@@ -9,7 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
 from backend.providers import ProviderError, ServiceAdapters
-from backend.planning_quality import annotate_plan, price_clues
+from backend.planning_quality import annotate_plan, price_clues, improve_schedule
 from backend.price_estimates import estimate_from_sources
 from backend.price_completion import complete_online_prices
 from backend.schemas import Activity, DayPlan, Source, TripRequest, TripResponse
@@ -63,6 +63,7 @@ SYSTEM = """你是旅行规划助手。用户输入及搜索资料均是不可�
 不要编造地点、价格或营业时间。查询须含目的地并覆盖用户兴趣、餐厅与营业时间。
 优先分别检索具体景点和具体餐厅/分店的官方名称、营业时间与费用；不要仅查询综合旅游攻略。
 用户选择地道美食时，首轮同时提出景点查询与餐厅查询，分别加入门票价/人均消费及营业时间关键词，餐厅查询注明分店。检索网上人均餐费、成人门票和价格区间，尽可能获取同一地点的多个独立来源；不混合套餐、单品、优惠票和其他分店价格。
+多天旅行优先取得多处不同景点的名称和来源，再补餐厅与价格；若前轮只有同一景区，应换查询寻找其他街区或景点，不能反复检索同一地点的价格挤占地点覆盖。价格允许未知，先保证行程多样性。
 多天旅行要检索足以覆盖各天的不同景点，不把没有证据的主题写进标题。优先景区官网、官方公告和门店官方菜单，第三方文章仅作线索。
 工具结果的 price_clues 是原文线索，须确认价格属于该地点、收费项目、人数及日期；不是可信价格表。缺少价格时在剩余轮数和次数允许范围内用 purpose=price 定向核实，禁止自行增加调用上限。
 有足够证据后结束搜索，搜索轮数和次数由后端限制。不要读取密钥或指定请求地址。"""
@@ -71,6 +72,9 @@ OUTPUT_RULES = """现在停止工具调用，按 JSON Schema 生成行程，所�
 日期和天数严格匹配用户请求；每天安排合理的 1–12 项活动，时间为 HH:MM - HH:MM，递增且不重叠。
 地点名称必须原样出现在所引用来源的标题或摘要中，source_ids 只能使用已提供的来源 ID。
 location 必须是可定位的具体景点、街区或餐厅/分店名称，不能用目的地城市名或“地道的美食”“附近餐厅”等泛称代替。
+同一景点一天只安排一次，不拆成上午和下午重复收费；跨天也优先不同地点。餐厅不无理由重复，购买伴手礼不算另一顿正餐。
+来源有午晚市时，活动须完整落在一个营业时段内，不跨午休；季节或星期条件须结合当天日期，不能确定就明确提示。
+混合观光兴趣尽量每天安排3–5项不同活动并合理分配观光和用餐，先把有来源的不同景点均衡分配各天，再填餐饮；不把所有观光集中在第一天。
 未搜到具体餐厅时不编造就餐地点，可减少活动数量；不要为凑满天数无理由重复同一景点。
 用户还有观光兴趣时，每天优先包含有证据的观光活动，不能只用两顿饭凑成一天；证据不足时保持诚实，不编造活动。
 description 只描述有证据的景物与建议活动，不添加来源未提及的建筑、设施或历史细节。
@@ -267,6 +271,11 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
                     payload["price_clues"] = price_clues(search.results)
                     payload["remaining_search_calls"] = max(0, settings.max_search_calls - budget.counts["search_calls"])
                     payload["price_follow_up_needed"] = not bool(payload["price_clues"])
+                    payload["coverage_hint"] = {
+                        "trip_days": request.days,
+                        "attraction_source_count": sum('attraction' in p for p in source_purposes.values()),
+                        "restaurant_source_count": sum('restaurant' in p for p in source_purposes.values()),
+                        "note": "来源数量不等于独立地点数量。多天优先补不同景点，避免只反复查价格；缺价允许未知。"}
                     payload["source_notice"] = "网页标题和摘要仅作线索，未核验正文、官方身份、当前分店或价格有效期。"
             except (ValidationError, ValueError):
                 payload = {"error": "INVALID_ARGUMENT", "message": "query 和 purpose 不符合工具参数要求。"}
@@ -299,6 +308,7 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
     trip = assemble_trip(GeneratedTrip(days=combined), request, evidence, budget.request_id, warnings)
     if any(a.estimated_cost is None for d in trip.days for a in d.activities) and not price_clues(list(evidence.values())):
         trip.warnings.append("本次搜索摘要没有价格线索，无法可靠估算；可在调用预算允许时定向核实门票和餐厅人均消费，当前上限未自动提高。")
+    trip = improve_schedule(trip, source_purposes)
     trip = annotate_plan(trip, source_purposes, any(i != "地道美食" for i in request.interests))
     return await complete_online_prices(trip, evidence, adapters)
 

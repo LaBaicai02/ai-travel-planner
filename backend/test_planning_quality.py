@@ -6,7 +6,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 import httpx
 from backend.agent import GeneratedTrip, SearchArguments, assemble_trip, generate_live
-from backend.planning_quality import annotate_plan, price_clues
+from backend.planning_quality import annotate_plan, price_clues, improve_schedule, opening_intervals
 from backend.providers import CallBudget, SearchHit, ServiceAdapters
 from backend.test_agent import Fixture, REQUEST, SETTINGS, output_for, tool_response, search_response
 from backend.test_itinerary_validation import evidence
@@ -57,6 +57,83 @@ class QualityTests(unittest.TestCase):
         self.assertEqual([s.id for s in trip.days[0].activities[0].sources],['s1'])
 
 
+class ScheduleTests(unittest.TestCase):
+    def trip(self, times, hours=None, price='40.00'):
+        output = output_for('s1')
+        template = output['days'][0]['activities'][0]
+        template.update(estimated_cost=price, cost_status='reference' if price else 'unknown',
+                        cost_basis='2人参考价格' if price else '', cost_evidence='门票20元' if price else None,
+                        opening_hours=hours, opening_hours_status='reported' if hours else 'unknown',
+                        opening_hours_evidence=hours)
+        output['days'][0]['activities'] = [dict(template, time=time) for time in times]
+        sources = {'s1':hit('s1', '西湖', '西湖 ' + ('门票20元。' if price else '价格未知。') + (hours or ''))}
+        return assemble_trip(GeneratedTrip.model_validate(output), REQUEST, sources, 'test', [])
+
+    def test_duplicate_attraction_removed_and_totals_recomputed_without_mutation(self):
+        trip = self.trip(['09:00 - 11:00', '14:00 - 16:00'])
+        result = improve_schedule(trip, {'s1':{'attraction'}})
+        self.assertEqual(len(result.days[0].activities), 1)
+        self.assertEqual(result.total_cost, Decimal('40'))
+        self.assertEqual(trip.total_cost, Decimal('80'))
+        self.assertEqual(len(trip.days[0].activities), 2)
+        self.assertTrue(any('重复安排已移除' in w for w in result.warnings))
+        self.assertEqual(result.days[0].activities[0].sources, trip.days[0].activities[0].sources)
+
+    def test_over_budget_warning_recalculated_after_duplicate_removal(self):
+        trip = self.trip(['09:00 - 11:00', '14:00 - 16:00'])
+        trip.budget = Decimal('60')
+        trip.warnings.append('已知活动费用超过预算，请调整安排；未缩小费用以满足预算。')
+        result = improve_schedule(trip, {'s1':{'attraction'}})
+        self.assertFalse(any('超过预算' in w for w in result.warnings))
+        trip.budget = Decimal('30')
+        result = improve_schedule(trip, {'s1':{'attraction'}})
+        self.assertTrue(any('超过预算' in w for w in result.warnings))
+
+    def test_repeated_meals_and_mixed_purpose_sources_not_deleted(self):
+        for purposes in ({'restaurant'}, {'attraction','restaurant'}):
+            result = improve_schedule(self.trip(['09:00 - 11:00','14:00 - 16:00']), {'s1':purposes})
+            self.assertEqual(len(result.days[0].activities), 2)
+            self.assertEqual(result.total_cost, Decimal('80'))
+            self.assertTrue(any('费用分别计算' in w for w in result.warnings))
+
+    def test_lunch_shortened_before_break_without_changing_prices_or_hours(self):
+        trip = self.trip(['13:00 - 16:00'], '周一至周日 10:30-14:30 16:30-20:30')
+        result = improve_schedule(trip, {'s1':{'restaurant'}})
+        activity = result.days[0].activities[0]
+        self.assertEqual(activity.time, '13:00 - 14:30')
+        self.assertEqual(activity.opening_hours, trip.days[0].activities[0].opening_hours)
+        self.assertEqual(result.total_cost, trip.total_cost)
+        self.assertTrue(any('已缩短' in w for w in result.warnings))
+        self.assertEqual(trip.days[0].activities[0].time, '13:00 - 16:00')
+
+    def test_closed_or_tiny_overlap_warns_without_guessing_a_new_time(self):
+        for time in ['15:00 - 16:00','14:20 - 16:00']:
+            result = improve_schedule(self.trip([time], '10:30-14:30;17:00-21:00'), {'s1':{'restaurant'}})
+            self.assertEqual(result.days[0].activities[0].time, time)
+            self.assertTrue(any('时间冲突' in w for w in result.warnings))
+
+    def test_seasonal_weekday_overnight_and_invalid_hours_not_guessed(self):
+        for hours in ['夏令时4月-10月 07:30-18:30;冬令时08:00-17:30',
+                      '周一闭馆，周二至周日09:00-17:00', '22:00-02:00', '25:00-26:00']:
+            self.assertIsNone(opening_intervals(hours))
+            result = improve_schedule(self.trip(['09:00 - 11:00'], hours), {'s1':{'attraction'}})
+            self.assertEqual(result.days[0].activities[0].time,'09:00 - 11:00')
+            self.assertTrue(any('人工确认' in w for w in result.warnings))
+
+    def test_unknown_prices_remain_unknown_after_duplicate_removal(self):
+        result = improve_schedule(self.trip(['09:00 - 11:00','14:00 - 16:00'], price=None), {'s1':{'attraction'}})
+        self.assertIsNone(result.total_cost)
+        self.assertEqual(result.known_cost_subtotal, Decimal('0'))
+        self.assertEqual(result.days[0].activities[0].cost_status,'unknown')
+
+    def test_plain_intervals_valid_and_in_range_schedule_unchanged(self):
+        self.assertEqual(opening_intervals('8:00—12:00；13:30～17:00'),[(480,720),(810,1020)])
+        trip = self.trip(['09:00 - 11:00','14:00 - 16:00'], '08:00-17:00')
+        result = improve_schedule(trip, {'s1':{'restaurant'}})
+        self.assertEqual([a.time for a in result.days[0].activities],['09:00 - 11:00','14:00 - 16:00'])
+        self.assertFalse(any('已缩短' in w for w in result.warnings))
+
+
 class PriceRoundtripTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_price_tool_quotes_support_per_person_total(self):
         def known(output):
@@ -65,6 +142,8 @@ class PriceRoundtripTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(payload['price_clues'])
             self.assertFalse(payload['price_follow_up_needed'])
             self.assertEqual(payload['remaining_search_calls'],0)
+            self.assertEqual(payload['coverage_hint']['trip_days'],REQUEST.days)
+            self.assertEqual(payload['coverage_hint']['attraction_source_count'],0)
             self.assertTrue(any('80元' in q['quote'] for q in payload['price_clues']))
             output['days'][0]['activities'][0].update(estimated_cost='160.00',cost_status='reference',
                 cost_basis='2人，每人导览参考价80元，共160元；以最新官方报价为准',cost_evidence='导览参考价80元/人')
