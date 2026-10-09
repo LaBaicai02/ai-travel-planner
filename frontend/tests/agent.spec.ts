@@ -20,6 +20,8 @@ test('页面通过真实后端 Agent 和 HTTP mock 生成行程，失败保留�
   await expect(page.locator('.day-card')).toHaveCount(1)
   await expect(page.locator('.activity')).toHaveCount(1)
   await expect(page.locator('.activity')).toContainText('西湖')
+  await expect(page.locator('.day-card h3')).toHaveText('第 1 天 · 西湖')
+  await expect(page.locator('.plan-warnings')).toContainText('尚未核验网页正文')
   await expect(page.locator('.source-links a').first()).toHaveAttribute('href', 'https://travel.example/west-lake')
   await expect(page.locator('.cost-summary')).toContainText('费用不完整')
   await expect(page.locator('.activity-cost')).toContainText('价格未知')
