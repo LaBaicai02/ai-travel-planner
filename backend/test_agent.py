@@ -208,13 +208,17 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(trip.days[0].activities),1)
 
     async def test_fourteen_days_complete_or_error_never_shortened(self):
-        def days(output):
-            output['days'] = [dict(copy.deepcopy(output['days'][0]), day=i+1,
-                date=(REQUEST.departure_date+timedelta(days=i)).isoformat()) for i in range(14)]
-            return output
-        trip,_=await self.execute(Fixture(outputs=[days]),request=REQUEST.model_copy(update={'days':14}))
+        def segment(offset, count):
+            def apply(output):
+                output['days'] = [dict(copy.deepcopy(output['days'][0]), day=i+1,
+                    date=(REQUEST.departure_date+timedelta(days=offset+i)).isoformat()) for i in range(count)]
+                return output
+            return apply
+        fixture = Fixture(outputs=[segment(0,5),segment(5,5),segment(10,4)])
+        trip,budget=await self.execute(fixture,request=REQUEST.model_copy(update={'days':14}))
         self.assertEqual(len(trip.days),14)
         self.assertEqual(trip.days[-1].date,REQUEST.departure_date+timedelta(days=13))
+        self.assertEqual(budget.counts['model_calls'],4)
 
     async def test_overlapping_times_and_fake_reference_prices_rejected(self):
         def overlap(output):

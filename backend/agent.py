@@ -204,17 +204,23 @@ def assemble_trip(output: GeneratedTrip, request: TripRequest, evidence: dict,
         trip.warnings.append("部分费用未知，完整总价不可计算；已知费用小计不代表全部支出。")
     if trip.known_cost_subtotal > request.budget:
         trip.warnings.append("已知活动费用超过预算，请调整安排；未缩小费用以满足预算。")
+    locations = [_compact(a.location) for d in trip.days for a in d.activities]
+    if len(set(locations)) < len(locations):
+        trip.warnings.append("行程包含重复地点，可能是再次游览或用餐；请核对是否符合偏好，搜索资料不足时无法保证每天都有不同地点。")
     return trip
 
 
 async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> TripResponse:
     settings, budget = adapters.settings, adapters.budget
-    if settings.max_model_calls < 3:
-        raise ProviderError("budget", "CALL_LIMIT", "真实生成至少需要三次模型调用的预算。")
+    chunk_count = (request.days + 4) // 5
+    minimum_calls = chunk_count + 2  # One search decision, each chunk, one shared repair.
+    if min(settings.max_model_calls, settings.max_model_http_attempts) < minimum_calls:
+        raise ProviderError("budget", "CALL_LIMIT", f"该行程分段生成至少需要 {minimum_calls} 次模型调用预算（含一次修复预留），请调整后端调用配置或减少天数。")
     messages = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": json.dumps(request.model_dump(mode="json"), ensure_ascii=False)}]
     evidence, warnings, seen_calls = {}, [], set()
-    for round_index in range(min(settings.max_search_rounds, settings.max_model_calls - 2)):
+    for round_index in range(min(settings.max_search_rounds, settings.max_model_calls - chunk_count - 1,
+                                 settings.max_model_http_attempts - chunk_count - 1)):
         choice = {"type": "function", "function": {"name": "search_travel_info"}} if round_index == 0 else "auto"
         result = await adapters.complete(messages, tools=[SEARCH_TOOL], tool_choice=choice)
         messages.append(result.message)
@@ -251,22 +257,43 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
             break
     if not evidence:
         raise ProviderError("search", "INSUFFICIENT_EVIDENCE", "没有获得可用旅行资料，请调整目的地或稍后重试。", True)
-    messages.append({"role": "user", "content": OUTPUT_RULES})
-    for attempt in range(2):
+    combined, repair_used = [], False
+    for offset in range(0, request.days, 5):
+        part = request.model_copy(update={"days": min(5, request.days - offset),
+                                         "departure_date": request.departure_date + timedelta(days=offset)})
+        previous_locations = list(dict.fromkeys(a.location for d in combined for a in d.activities))
+        instructions = {"segment_request": part.model_dump(mode="json"),
+                        "previous_locations": previous_locations,
+                        "instructions": "只生成 segment_request 日期范围，day 从 1 开始。优先避免重复已有地点。每天合理安排，描述简短，不为凑数量添加活动。"}
+        segment_messages = messages + [{"role": "user", "content": OUTPUT_RULES},
+                                      {"role": "user", "content": json.dumps(instructions, ensure_ascii=False)}]
+        parsed, repaired = await _generate_segment(part, adapters, evidence, segment_messages, not repair_used)
+        repair_used = repair_used or repaired
+        combined.extend(day.model_copy(update={"day": offset + index + 1}) for index, day in enumerate(parsed.days))
+    return assemble_trip(GeneratedTrip(days=combined), request, evidence, budget.request_id, warnings)
+
+
+async def _generate_segment(request, adapters, evidence, messages, allow_repair):
+    """Validate each segment; one repair allowance is shared by the whole trip."""
+    for attempt in range(2 if allow_repair else 1):
         result = None
         try:
             result = await adapters.complete(messages, output_model=GeneratedTrip)
             if not isinstance(result.parsed, GeneratedTrip):
                 raise _output_error()
-            return assemble_trip(result.parsed, request, evidence, budget.request_id, warnings)
+            assemble_trip(result.parsed, request, evidence, adapters.budget.request_id, [])
+            return result.parsed, attempt == 1
         except ProviderError as exc:
             if hasattr(exc, "validation_reason"):
                 logger.warning("request_id=%s error_code=INVALID_MODEL_OUTPUT phase=ITINERARY_VALIDATION check=%s fields=%s counts=%s",
-                               budget.request_id, exc.validation_reason, exc.validation_field, budget.counts)
-            if exc.code != "INVALID_MODEL_OUTPUT" or attempt == 1:
+                               adapters.budget.request_id, exc.validation_reason, exc.validation_field, adapters.budget.counts)
+            if exc.code != "INVALID_MODEL_OUTPUT" or attempt == 1 or not allow_repair:
                 raise
             if result is not None and isinstance(result.parsed, GeneratedTrip):
                 # Retain only in request memory and the model conversation, never logs.
                 messages.append(result.message)
-            messages.append({"role": "user", "content": "后端校验反馈：" + exc.message + " 请重新依据已有资料输出完整 JSON，必须提供 Schema 中所有必填字段。金额为两位小数字符串，未知必须显式填 null；cost_basis 未知时填空字符串。核对日期、天数、时间顺序、已登记来源 ID、地点原文、费用和营业时间证据。无法证实的费用及营业时间设为未知。不得调用工具。"})
+            specific = ""
+            if getattr(exc, "validation_reason", "") in {"cost_quote_missing", "cost_price_missing", "reference_price_mismatch", "cost_zero_unsupported"}:
+                specific = " 对失败活动重新检查价格原文；无法在对应地点来源中确认时，将 estimated_cost、cost_evidence 设 null，cost_status 设 unknown，cost_basis 设空字符串。不要只改引文措辞或自行推算价格。"
+            messages.append({"role": "user", "content": "后端校验反馈：" + exc.message + specific + " 请重新依据已有资料输出完整 JSON，必须提供 Schema 中所有必填字段。金额为两位小数字符串，未知必须显式填 null；cost_basis 未知时填空字符串。核对日期、天数、时间顺序、已登记来源 ID、地点原文、费用和营业时间证据。无法证实的费用及营业时间设为未知。不得调用工具。"})
     raise AssertionError("unreachable")
