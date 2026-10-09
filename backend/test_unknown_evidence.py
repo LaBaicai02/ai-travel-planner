@@ -78,7 +78,7 @@ class UnknownRoundtripTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(trip.demo)
         self.assertEqual(budget.counts['model_calls'],2)
         self.assertEqual(budget.counts['search_calls'],1)
-        self.assertIsNone(trip.total_cost)
+        self.assertEqual(str(trip.total_cost),'0.00')
         self.assertIsNone(trip.days[0].activities[0].opening_hours)
         self.assertTrue(any('营业时间未通过' in w for w in trip.warnings))
 

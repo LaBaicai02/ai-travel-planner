@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 from backend.providers import ProviderError, ServiceAdapters
 from backend.planning_quality import annotate_plan, price_clues
 from backend.price_estimates import estimate_from_sources
+from backend.price_completion import complete_online_prices
 from backend.schemas import Activity, DayPlan, Source, TripRequest, TripResponse
 
 
@@ -298,7 +299,8 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
     trip = assemble_trip(GeneratedTrip(days=combined), request, evidence, budget.request_id, warnings)
     if any(a.estimated_cost is None for d in trip.days for a in d.activities) and not price_clues(list(evidence.values())):
         trip.warnings.append("本次搜索摘要没有价格线索，无法可靠估算；可在调用预算允许时定向核实门票和餐厅人均消费，当前上限未自动提高。")
-    return annotate_plan(trip, source_purposes, any(i != "地道美食" for i in request.interests))
+    trip = annotate_plan(trip, source_purposes, any(i != "地道美食" for i in request.interests))
+    return await complete_online_prices(trip, evidence, adapters)
 
 
 def _repair_issues(output: GeneratedTrip, request: TripRequest, evidence: dict,

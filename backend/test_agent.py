@@ -91,7 +91,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         fixture = Fixture()
         trip, budget = await self.execute(fixture)
         self.assertFalse(trip.demo)
-        self.assertIsNone(trip.total_cost)
+        self.assertEqual(str(trip.total_cost),'0.00')
         self.assertEqual(trip.days[0].activities[0].sources[0].id, fixture.source_id)
         self.assertEqual(budget.counts, dict(model_calls=3, search_calls=1, model_http_attempts=3, search_http_attempts=1))
         messages = fixture.requests[-1][1]['messages']
@@ -238,8 +238,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         for invalid in [fake_price,unrelated_price]:
             with self.subTest(invalid=invalid):
                 trip,_=await self.execute(Fixture(outputs=[invalid]))
-                self.assertIsNone(trip.days[0].activities[0].estimated_cost)
-                self.assertEqual(trip.days[0].activities[0].cost_status,'unknown')
+                self.assertEqual(str(trip.days[0].activities[0].estimated_cost),'0.00')
+                self.assertEqual(trip.days[0].activities[0].cost_status,'reference')
                 self.assertTrue(any('未通过来源证据校验' in w for w in trip.warnings))
 
     async def test_outer_timeout_cancels_upstream(self):
@@ -277,7 +277,7 @@ class LiveRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code,200,response.text)
         self.assertEqual(response.json()['mode'],'live')
         self.assertEqual(response.json()['days'][0]['activities'][0]['sources'][0]['url'],'https://travel.example/west-lake')
-        self.assertIsNone(response.json()['total_cost'])
+        self.assertEqual(response.json()['total_cost'],'0.00')
 
     def test_error_status_and_no_demo_fallback(self):
         for status in [401,429,500]:

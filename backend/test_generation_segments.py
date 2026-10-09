@@ -99,8 +99,8 @@ class SegmentTests(unittest.IsolatedAsyncioTestCase):
             return output
         fixture=Fixture(outputs=[wrong])
         trip,budget=await self.run_fixture(fixture,days=1)
-        self.assertIsNone(trip.total_cost)
-        self.assertEqual(trip.days[0].activities[0].cost_status,'unknown')
+        self.assertEqual(str(trip.total_cost),'0.00')
+        self.assertEqual(trip.days[0].activities[0].cost_status,'reference')
         self.assertTrue(any('未通过来源证据校验' in w for w in trip.warnings))
         self.assertEqual(budget.counts['model_calls'],3)  # Two search decisions plus generation.
         self.assertEqual(len([b for _,b in fixture.requests if 'response_format' in b]),1)

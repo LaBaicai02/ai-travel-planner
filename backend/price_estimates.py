@@ -57,4 +57,4 @@ def estimate_from_sources(location, hits, travelers):
     basis = (f'{travelers}人；依据{len(samples)}条网上{samples[0][0]}价格样本（来源{ids}），'
              f'区间取中点，再取算术平均：每人约{per_person:.2f}元 × {travelers} = {total:.2f}元。'
              '仅为本次检索样本估算，并非全网平均价；不含额外项目，实际以菜单或售票处为准。')
-    return {'amount': format(total, '.2f'), 'basis': basis[:500], 'quote': samples[0][2], 'count': len(samples)}
+    return {'amount': format(total, '.2f'), 'basis': basis[:500], 'quote': samples[0][2], 'count': len(samples), 'source_ids': [s[3] for s in samples]}

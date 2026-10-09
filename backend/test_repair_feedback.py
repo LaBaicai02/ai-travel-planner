@@ -98,7 +98,7 @@ class FeedbackRoundtripTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(budget.counts['model_calls'],3)
         self.assertEqual(budget.counts['search_calls'],1)
         self.assertFalse(trip.demo)
-        self.assertIsNone(trip.total_cost)
+        self.assertEqual(str(trip.total_cost),'0.00')
 
     async def test_new_bad_location_after_repair_still_fails_at_three_calls(self):
         def bad_location(output):
