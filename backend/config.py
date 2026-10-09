@@ -18,6 +18,8 @@ class Settings(BaseModel):
     trip_timeout_seconds: float = Field(default=120, gt=0, le=600, allow_inf_nan=False)
     llm_timeout_seconds: float = Field(default=45, gt=0, le=300, allow_inf_nan=False)
     search_timeout_seconds: float = Field(default=10, gt=0, le=60, allow_inf_nan=False)
+    max_search_rounds: int = Field(default=3, ge=1, le=3)
+    max_concurrent_trips: int = Field(default=2, ge=1, le=10)
     max_search_calls: int = Field(default=6, ge=1, le=20)
     max_model_calls: int = Field(default=5, ge=1, le=20)
     max_search_http_attempts: int = Field(default=8, ge=1, le=40)
@@ -31,6 +33,7 @@ class Settings(BaseModel):
                 name: os.environ[name.upper()]
                 for name in (
                     "trip_timeout_seconds", "llm_timeout_seconds", "search_timeout_seconds",
+                    "max_search_rounds", "max_concurrent_trips",
                     "max_search_calls", "max_model_calls", "max_search_http_attempts",
                     "max_model_http_attempts", "max_upstream_retries",
                 )

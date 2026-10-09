@@ -1,8 +1,8 @@
 # 漫游 · AI 旅行规划助手
 
-中文基础演示版，React + TypeScript + Vite 前端，FastAPI + Python 后端。目的地、出发日期、旅行天数、人数、预算、币种与多选兴趣经前后端校验后，生成按天排列的活动卡片，展示时间、模拟地点、活动说明及预计费用。支持加载、错误提示、15 秒请求超时及重新生成，适配桌面与手机。
+中文基础演示版，React + TypeScript + Vite 前端，FastAPI + Python 后端。目的地、出发日期、旅行天数、人数、预算、币种与多选兴趣经前后端校验后，生成按天排列的活动卡片，展示时间、模拟地点、活动说明及预计费用。支持加载、错误提示、演示 15 秒／真实 130 秒请求超时及重新生成，适配桌面与手机。
 
-**演示数据**：当前页面与行程接口仍使用演示生成器；第二阶段已实现独立模型/搜索适配层，但尚未接入 Agent、地图或预订。每次请求从兴趣相关模板中随机编排行程，地点均明确标注模拟；重新生成可能出现相同组合。不需要 API 密钥。
+**模式**：demo 使用演示生成器，无需密钥；live 已接入千问＋博查 Agent，通过搜索证据生成真实模式行程，不包含地图或预订。demo 每次从兴趣模板随机编排，地点明确标注模拟；live 失败只返回错误，绝不回退演示。真实费用和营业时间可能未知，来源可追溯不代表准确性保证。
 
 ## 环境与安装
 
@@ -54,7 +54,7 @@ Vite 将 /api 代理到后端，浏览器使用同源请求。生产构建输出
 - 日期允许 2000-01-01 至 2100-12-18，确保最长行程不会越过 2100 年。
 - 预算大于 0、最多 1000 万且最多两位小数。支持 CNY、USD、EUR、JPY。
 - 预算与费用均为**所有旅客的活动总额**，不含往返交通、住宿和额外购物。币种作为计价单位，不进行汇率转换。
-- 每天 4 项活动，模拟成本约占预算 70%，按分向下取整。极低预算可能展示零费用，这只是预算分配模拟，不代表真实免费。
+- 演示每天 4 项活动；真实模式每天允许 1–12 项。模拟成本约占预算 70%，按分向下取整。极低预算可能展示零费用，这只是预算分配模拟，不代表真实免费。
 - 不保存用户输入，刷新页面会重置。
 
 ## 检查
@@ -89,7 +89,7 @@ $travelNode = "$env:USERPROFILE/.cache/codex-runtimes/codex-primary-runtime/depe
 
 ## 第一阶段：模式与数据契约
 
-第一阶段完成模块拆分与契约扩展；第二阶段独立适配层见下文。页面仍不调用模型或搜索，没有新增依赖。
+第一阶段完成模块拆分与契约扩展，第二阶段完成服务适配层；第三阶段 live 已接入 Agent。沿用现有依赖。
 
 - `backend/schemas.py`：请求校验、来源、费用与模式契约。每天允许 1–12 项活动；演示生成器仍固定四项。
 - `backend/demo.py`：保留随机兴趣模板与预算约 70% 分配逻辑。
@@ -131,7 +131,7 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 
 - demo：ready=true，无需密钥，支持四种币种。
 - live 缺配置：configured=false、ready=false；行程请求返回 HTTP 503，code 为 LIVE_NOT_CONFIGURED。
-- live 配置齐全：configured=true、ready=false；行程请求仍返回 HTTP 503，code 为 LIVE_NOT_IMPLEMENTED。
+- live 配置齐全：configured=true、ready=true、live_integration_available=true；行程请求调用 Agent。ready 只表示本地配置与入口就绪，不验证外部连通性。
 - live 非 CNY 请求：HTTP 422，code 为 UNSUPPORTED_CURRENCY。
 - 所有 live 路径均不回退 demo。前端在服务状态未知或不可用时禁止生成。
 - 错误格式：`{"error":{"code":"…","message":"中文说明","retryable":false,"request_id":"…"}}`。
@@ -162,7 +162,7 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 
 ## 第二阶段：千问与博查服务适配层
 
-仅新增独立适配层，不包含完整 Agent。所有 `/api/itineraries` live 请求仍返回 LIVE_NOT_IMPLEMENTED（缺配置时为 LIVE_NOT_CONFIGURED），健康检查 ready=false、live_integration_available=false；配置密钥不会自动启用真实行程。没有模拟回退或第二家服务自动切换，没有新增依赖或修改主要页面。
+第二阶段实现独立适配层；当时尚未接入 Agent。第三阶段现已连接 live 行程接口，见下文。没有模拟回退或第二家服务自动切换，没有新增依赖或修改主要页面。
 
 ### 官方文档核实（2026-10-09）
 
@@ -190,11 +190,11 @@ $env:BOCHA_BASE_URL = "https://api.bocha.cn"
 
 准备百炼北京地域账户的模型权限、有效额度，以及博查账户的可用额度。[博查控制台](https://open.bocha.cn/)用于获取其密钥。先停止旧后端以释放端口；变量仅影响此终端及其新启动的子进程，修改后须重启。前端使用另一终端，不配置这些变量；start.ps1 也会阻止两项密钥传给 Vite。
 
-`backend/.env.example` 只是参考清单，**不会自动读取**，复制成 .env 同样不会生效。本阶段正常使用页面时继续设置 TRAVEL_MODE=demo。密钥配齐只表示配置有效；没有真实连通证据，健康检查也不发送付费请求。
+`backend/.env.example` 只是参考清单，**不会自动读取**，复制成 .env 同样不会生效。仅演示页面时设置 TRAVEL_MODE=demo；需要真实生成时设 live 并配置密钥。密钥配齐只表示配置有效；没有真实连通证据，健康检查也不发送付费请求。
 
 ### 适配层契约与调用限制
 
-`backend/providers.py` 的 `ServiceAdapters(settings, client, budget)` 由未来后端 Agent 使用。调用方负责 `httpx.AsyncClient` 的 async with 生命周期；同一顶层请求的所有适配层调用必须共享一个 `CallBudget(settings, request_id=...)`，不能每次调用重新创建预算。测试使用 MockTransport，无 DNS 或服务网络访问。
+`backend/providers.py` 的 `ServiceAdapters(settings, client, budget)` 由后端 Agent 使用。调用方负责 `httpx.AsyncClient` 的 async with 生命周期；同一顶层请求的所有适配层调用必须共享一个 `CallBudget(settings, request_id=...)`，不能每次调用重新创建预算。测试使用 MockTransport，无 DNS 或服务网络访问。
 
 - `complete(messages, tools=..., tool_choice=..., output_model=...)` 返回 ModelResult：assistant message、原生工具调用（id/name/arguments）、可选 parsed Pydantic 实例及 usage。保留工具消息的 tool_call_id 供后续轮次回传；参数 JSON 必须是对象。完整工具参数业务校验、执行循环和一次格式修复属于第三阶段。
 - `search(query)` 返回 SearchResult：query、results、warnings。结果含稳定来源 ID、标题、实际 HTTP/HTTPS URL、摘要、UTC 检索时间及可选来源发布日期文本。取 summary，缺失时用 snippet；去重、移除 URL 片段、丢弃非法条目，最多五条，标题最多 200 字、摘要最多 1,500 字。没有查到的价格和营业时间不会由适配层补齐。
@@ -236,7 +236,7 @@ npx.cmd playwright test
 
 HTTP mock 覆盖请求地址与鉴权、原生工具协议、JSON Schema、搜索归一化、401/403、429、5xx、网络故障、请求/总时限、空结果、异常响应、重试与共享预算、取消和日志脱敏；demo/live 不回退的接口基线保持。
 
-**真实连通验证未完成**：未提供真实密钥，本次没有向千问或博查发送实际 API 请求。mock 通过不能证明本机连通性、账户权限/额度、搜索覆盖或实际模型输出质量。第三阶段尚未开始：Agent 搜索循环、行程结构化生成、来源关联、接口集成和真实样例验收仍待实施。
+**真实连通验证未完成**：未提供真实密钥，本次没有向千问或博查发送实际 API 请求。mock 通过不能证明本机连通性、账户权限/额度、搜索覆盖或实际模型输出质量。第三阶段已实现 Agent 搜索循环、结构化生成、来源关联与接口集成；真实行程样例验收仍待执行。用户已在普通 PowerShell 报告两家 API 连通，本轮工具进程仍看不到密钥。
 
 ### 密钥就绪后的最小连通验证（尚未执行）
 
@@ -281,3 +281,53 @@ asyncio.run(main())
 额度分类参考[百炼错误码](https://help.aliyun.com/zh/model-studio/error-code)与[免费额度状态文档](https://help.aliyun.com/zh/model-studio/model-usage-statistics)，包含 Arrearage、isv.OUT_OF_SERVICE、AllocationQuota.FreeTierOnly，均不自动重试。
 
 后续接续先查看 [PROGRESS.md](PROGRESS.md)，无需重新阅读全部项目。
+
+## 第三阶段：真实行程 Agent
+
+已接入 `backend/agent.py` 与 `/api/itineraries`：首轮指定 `search_travel_info` 原生工具调用；后端校验 query/purpose、执行博查并按 tool_call_id 回传结果；最多三轮决策，随后移除工具，要求 JSON Schema 输出。所有调用共享原有总期限与调用预算；默认最多 3 轮搜索、6 次搜索、5 次模型请求（含一次输出修复），实际 HTTP 上限仍为搜索 8／模型 6（含重试）。新增 `MAX_SEARCH_ROUNDS=3`（1–3）与 `MAX_CONCURRENT_TRIPS=2`（1–10，每个后端 worker 独立限制）。
+
+模型不能提供来源 URL、人数、币种或合计；后端使用原请求生成确定字段、登记来源 ID 并汇总 Decimal 金额。校验天数/日期、每日 1–12 项、时间顺序及不重叠、地点在相关来源原文中出现、已知金额与营业时间的原文依据。未知费用为 null；任何未知会令完整合计为 null，保留已知费用小计。参考价核对原文金额或按人数计算；估算仍需来源价格依据和说明，不保证市场实际报价。来源内容及用户文本不能覆盖系统规则。上述检查是形式与证据关联校验，不能替代地点、价格和开放时间的人工核实。
+
+搜索全部失败／无证据明确报错；部分失败可依据成功资料继续，并显示警告。仅 JSON/Schema/业务输出错误允许一次无工具修复；拒绝、空输出和截断直接失败。上游错误 HTTP 502，总超时 504，配置不可用 503，并发满 429；错误包含 code/message/retryable/request_id，绝不切换 demo。总期限或客户端断开会取消剩余任务；已发出的请求仍可能计费。
+
+### 本地一次真实验收（尚未由本轮工具执行）
+
+停止旧后端，在已设置两项密钥及匹配百炼地址的同一 PowerShell 启动。不要把密钥复制到聊天或前端。`.env.example` 不自动加载。
+
+~~~powershell
+$env:TRAVEL_MODE = "live"
+# 首次验收限制预算：零重试，最多两次搜索、一次决策加生成与一次格式修复
+$env:MAX_UPSTREAM_RETRIES = "0"
+$env:MAX_SEARCH_ROUNDS = "1"
+$env:MAX_SEARCH_CALLS = "2"
+$env:MAX_SEARCH_HTTP_ATTEMPTS = "2"
+$env:MAX_MODEL_CALLS = "3"
+$env:MAX_MODEL_HTTP_ATTEMPTS = "3"
+.\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+~~~
+
+刷新 http://127.0.0.1:5173/，应显示真实模式且允许生成。仅提交一次杭州、1 天、1 人、CNY 小样例。检查 demo=false、来源可点击、未知不显示免费、营业时间可追溯、已知费用小计正确；失败先分析中文错误，不反复点击。本轮工具进程无法看到密钥，付费真实生成验收仍未完成。用户此前报告两家 API 连通，不等于此次 Agent 链路已通过真实验收。
+
+### 可复现的离线浏览器闭环
+
+`backend.e2e_mock` 仅用于测试，使用测试密钥和 MockTransport，绝不连接真实服务。启动测试后端：
+
+~~~powershell
+.\.venv\Scripts\python.exe -B -m backend.e2e_mock
+~~~
+
+将独立 Vite 测试页代理到 8001（frontend 目录，Node 20+）：
+
+~~~powershell
+node --input-type=module -e "import {createServer} from './node_modules/vite/dist/node/index.js'; const server=await createServer({server:{host:'127.0.0.1',port:5174,strictPort:true,proxy:{'/api':'http://127.0.0.1:8001'}}}); await server.listen(); server.printUrls();"
+~~~
+
+另一个 frontend PowerShell 运行：
+
+~~~powershell
+$env:TRAVEL_E2E_BASE_URL = "http://127.0.0.1:5174"
+$env:TRAVEL_AGENT_E2E_BACKEND = "http://127.0.0.1:8001"
+npx.cmd playwright test --workers=1
+~~~
+
+默认页面测试仍使用 5173；新增 Agent 浏览器测试仅在显式设置测试后端变量时运行，默认跳过，不会访问付费服务。测试覆盖页面到真实后端 Agent 再到 HTTP mock 的流程，与真实外部 API 验收分开记录。

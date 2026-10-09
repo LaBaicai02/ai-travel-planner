@@ -29,7 +29,7 @@ class TripTests(unittest.TestCase):
         self.assertTrue(health["demo"] and health["configured"] and health["ready"])
         self.assertEqual(health["mode"], "demo")
         self.assertEqual(health["supported_currencies"], ["CNY", "USD", "EUR", "JPY"])
-        self.assertFalse(health["live_integration_available"])
+        self.assertTrue(health["live_integration_available"])
 
     def test_plan_and_cost_totals(self):
         response = self.client.post("/api/itineraries", json=VALID)
@@ -113,15 +113,15 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(response.json()["error"]["code"], "LIVE_NOT_CONFIGURED")
             self.assertNotIn("days", response.json())
 
-    def test_live_configured_still_unimplemented_and_no_external_http(self):
+    def test_live_configured_ready_and_upstream_failure_never_uses_demo(self):
         settings = Settings(mode="live", dashscope_api_key="test", bocha_api_key="test", llm_base_url="https://example.com/v1")
         with TestClient(create_app(settings)) as client, patch("httpx.HTTPTransport.handle_request", side_effect=AssertionError("external HTTP prohibited")), patch("httpx.AsyncHTTPTransport.handle_async_request", side_effect=AssertionError("external HTTP prohibited")), patch("backend.main.generate_demo", side_effect=AssertionError("must not use demo")):
             health = client.get("/api/health").json()
             self.assertTrue(health["configured"])
-            self.assertFalse(health["ready"])
+            self.assertTrue(health["ready"] and health["live_integration_available"])
             response = client.post("/api/itineraries", json=VALID)
-            self.assertEqual(response.status_code, 503)
-            self.assertEqual(response.json()["error"]["code"], "LIVE_NOT_IMPLEMENTED")
+            self.assertEqual(response.status_code, 502)
+            self.assertEqual(response.json()["error"]["code"], "GENERATION_FAILED")
             self.assertEqual(client.post("/api/itineraries", json={**VALID, "currency": "USD"}).status_code, 422)
 
     def test_demo_no_external_http(self):
