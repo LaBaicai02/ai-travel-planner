@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import time
 from uuid import uuid4
 
 import httpx
@@ -13,6 +15,9 @@ from backend.providers import CallBudget, ProviderError, ServiceAdapters
 from backend.schemas import HealthResponse, TripRequest, TripResponse
 
 
+logger = logging.getLogger(__name__)
+
+
 async def wait_for_disconnect(request: Request):
     while True:
         message = await request.receive()
@@ -23,6 +28,7 @@ async def wait_for_disconnect(request: Request):
 async def run_live(request: Request, trip: TripRequest, settings: Settings,
                    request_id: str, transport=None):
     budget = CallBudget(settings, request_id=request_id)
+    started = time.monotonic()
     async with httpx.AsyncClient(transport=transport) as client:
         generation = asyncio.create_task(generate_live(trip, ServiceAdapters(settings, client, budget)))
         disconnect = asyncio.create_task(wait_for_disconnect(request))
@@ -34,6 +40,11 @@ async def run_live(request: Request, trip: TripRequest, settings: Settings,
             if disconnect in done:
                 raise ProviderError("client", "CLIENT_DISCONNECTED", "客户端已断开，生成已取消。")
             raise ProviderError("budget", "TOTAL_TIMEOUT", "生成请求已超过总时限。", True)
+        except ProviderError as exc:
+            # Backend-owned counters only; never attach payloads or credentials.
+            exc.call_counts = dict(budget.counts)
+            exc.elapsed_ms = int((time.monotonic() - started) * 1000)
+            raise
         finally:
             for task in (generation, disconnect):
                 if not task.done():
@@ -90,7 +101,16 @@ def create_app(settings: Settings | None = None, *, transport=None) -> FastAPI:
         except ProviderError as exc:
             status = 504 if exc.code == "TOTAL_TIMEOUT" else (
                 503 if exc.code in {"CONFIGURATION_ERROR", "UNSUPPORTED_MODEL"} else 502)
-            return failure(exc.code, exc.message, request_id, status, exc.retryable)
+            message = exc.message
+            if exc.code == "UPSTREAM_TIMEOUT":
+                provider = exc.provider if exc.provider in {"model", "search"} else "unknown"
+                name = {"model": "千问模型", "search": "博查搜索"}.get(provider, "上游服务")
+                limit = settings.llm_timeout_seconds if provider == "model" else settings.search_timeout_seconds if provider == "search" else None
+                detail = f"（单次配置上限 {limit:g} 秒，实际还受总期限限制）" if limit is not None else ""
+                message = name + "请求超时" + detail + "。本次未完成生成；请保留请求编号排查，不建议连续重试。"
+                logger.warning("request_id=%s provider=%s error_code=UPSTREAM_TIMEOUT elapsed_ms=%s counts=%s",
+                               request_id, provider, getattr(exc, "elapsed_ms", "unknown"), getattr(exc, "call_counts", {}))
+            return failure(exc.code, message, request_id, status, exc.retryable)
         except Exception:
             # Never return raw upstream errors, credentials, or a demo fallback.
             return failure("GENERATION_FAILED", "行程生成失败，请稍后重试。", request_id, 502, True)
