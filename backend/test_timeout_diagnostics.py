@@ -65,5 +65,22 @@ class TimeoutDiagnosticsTests(unittest.TestCase):
         self.assertEqual(response.json()['error']['code'],'TOTAL_TIMEOUT')
         self.assertEqual(response.json()['error']['message'],'生成请求已超过总时限。')
 
+    def test_total_timeout_logs_phase_elapsed_and_counts_from_live_runner(self):
+        async def fail(trip, adapters):
+            adapters.budget.phase = "ITINERARY_REPAIR"
+            adapters.budget.consume("model")
+            raise ProviderError("budget", "TOTAL_TIMEOUT", "生成请求已超过总时限。", True)
+        with patch('backend.main.generate_live', fail), self.assertLogs('backend.main', level='WARNING') as logs:
+            with TestClient(create_app(SETTINGS)) as client:
+                response = client.post('/api/itineraries', json=REQUEST.model_dump(mode='json'))
+        self.assertEqual(response.status_code, 504)
+        log = ' '.join(logs.output)
+        self.assertIn(response.json()['error']['request_id'], log)
+        self.assertIn('phase=ITINERARY_REPAIR', log)
+        self.assertIn('elapsed_ms=', log)
+        self.assertIn("'model_calls': 1", log)
+        for secret in ['test-key', 'Authorization', '杭州']:
+            self.assertNotIn(secret, log)
+
 
 if __name__=='__main__':unittest.main()

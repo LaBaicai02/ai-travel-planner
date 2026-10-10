@@ -220,8 +220,15 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
                 {"role": "user", "content": json.dumps(request.model_dump(mode="json"), ensure_ascii=False)}]
     evidence, warnings, seen_calls = {}, [], set()
     source_purposes = {}
+    generation_reserve = min(settings.llm_timeout_seconds * (chunk_count + 1),
+                             settings.trip_timeout_seconds * 0.6)
     for round_index in range(min(settings.max_search_rounds, settings.max_model_calls - chunk_count - 1,
                                  settings.max_model_http_attempts - chunk_count - 1)):
+        # Subsequent decisions are optional; leave time for generation and repair.
+        if evidence and budget.remaining() < generation_reserve + settings.llm_timeout_seconds + 1:
+            warnings.append("为行程生成与校验预留时间，已停止追加搜索决策；资料可能不完整。")
+            break
+        budget.phase = "SEARCH_DECISION"
         choice = {"type": "function", "function": {"name": "search_travel_info"}} if round_index == 0 else "auto"
         result = await adapters.complete(messages, tools=[SEARCH_TOOL], tool_choice=choice)
         messages.append(result.message)
@@ -239,7 +246,11 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
                     raise ValueError
                 if budget.counts["search_calls"] >= settings.max_search_calls:
                     payload = {"error": "SEARCH_CALL_LIMIT", "message": "搜索次数已用完。"}
+                elif evidence and budget.remaining() < generation_reserve + settings.search_timeout_seconds + 1:
+                    payload = {"error": "SEARCH_TIME_RESERVED", "message": "剩余时间已预留给行程生成与校验，不再执行本次搜索。"}
+                    warnings.append("为行程生成与校验预留时间，已跳过部分搜索；资料可能不完整。")
                 else:
+                    budget.phase = "TRAVEL_SEARCH"
                     search = await adapters.search(arguments.query)
                     evidence.update({hit.id: hit for hit in search.results})
                     for hit in search.results:
@@ -283,7 +294,7 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
                         "instructions": "只生成 segment_request 日期范围，day 从 1 开始。优先避免重复已有地点。每天合理安排，描述简短，不为凑数量添加活动。"}
         segment_messages = messages + [{"role": "system", "content": OUTPUT_RULES + "\n" + GENERATION_EXAMPLES},
                                       {"role": "user", "content": json.dumps(instructions, ensure_ascii=False)}]
-        parsed, repaired, fact_warnings = await _generate_segment(part, adapters, evidence, segment_messages, not repair_used, source_purposes)
+        parsed, repaired, fact_warnings = await _generate_segment(part, adapters, evidence, segment_messages, not repair_used, source_purposes, chunk_count - offset // 5 - 1)
         warnings.extend((f"第 {offset + 1}–{offset + part.days} 天：" + warning) if chunk_count > 1 else warning for warning in fact_warnings)
         repair_used = repair_used or repaired
         combined.extend(day.model_copy(update={"day": offset + index + 1}) for index, day in enumerate(parsed.days))
@@ -443,7 +454,7 @@ def _classifications(output):
             for day in output.days for index, activity in enumerate(day.activities)}
 
 
-async def _generate_segment(request, adapters, evidence, messages, allow_repair, source_purposes=None):
+async def _generate_segment(request, adapters, evidence, messages, allow_repair, source_purposes=None, remaining_chunks=0):
     """Validate each segment; one repair allowance is shared by the whole trip."""
     output_model = GeneratedTrip
     source_purposes = source_purposes or {}
@@ -451,6 +462,7 @@ async def _generate_segment(request, adapters, evidence, messages, allow_repair,
     for attempt in range(2 if allow_repair else 1):
         result = None
         try:
+            adapters.budget.phase = "ITINERARY_GENERATION" if attempt == 0 else "ITINERARY_REPAIR"
             result = await adapters.complete(messages, output_model=output_model)
             if not isinstance(result.parsed, GeneratedTrip):
                 raise _output_error()
@@ -460,6 +472,8 @@ async def _generate_segment(request, adapters, evidence, messages, allow_repair,
             restaurant_sources = sum('restaurant' in purposes for purposes in source_purposes.values())
             # Use the existing global repair allowance, never another search loop.
             if gaps and restaurant_sources >= 2 and attempt == 0 and allow_repair:
+                if adapters.budget.remaining() < adapters.settings.llm_timeout_seconds * (remaining_chunks + 1) + 1:
+                    return candidate, False, fact_warnings + ["剩余时间优先用于完成行程，已跳过可选餐次补充；餐次缺口请确认。"]
                 meal_fallback = (candidate, fact_warnings)
                 constrained, candidates = _grounded_repair_model(candidate, request, evidence)
                 if constrained is not None:
@@ -482,6 +496,10 @@ async def _generate_segment(request, adapters, evidence, messages, allow_repair,
                 logger.warning("request_id=%s error_code=INVALID_MODEL_OUTPUT phase=ITINERARY_VALIDATION check=%s fields=%s counts=%s",
                                adapters.budget.request_id, exc.validation_reason, exc.validation_field, adapters.budget.counts)
             if exc.code != "INVALID_MODEL_OUTPUT" or attempt == 1 or not allow_repair:
+                raise
+            if adapters.budget.remaining() < adapters.settings.llm_timeout_seconds * (remaining_chunks + 1) + 1:
+                # Invalid core output is never returned as a successful itinerary.
+                exc.message += " 剩余时间不足以预留完整修复窗口，已停止修复，未返回无效行程。"
                 raise
             if result is not None and isinstance(result.parsed, GeneratedTrip):
                 # Retain only in request memory and the model conversation, never logs.

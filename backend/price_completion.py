@@ -43,9 +43,12 @@ async def complete_online_prices(trip, evidence, adapters):
             if result is None and name not in cache:
                 cache[name] = True
                 budget, settings = adapters.budget, adapters.settings
-                if budget.counts['search_calls'] < settings.max_search_calls and budget.counts['search_http_attempts'] < settings.max_search_http_attempts:
+                if budget.remaining() < settings.search_timeout_seconds + 1:
+                    data['warnings'].append('剩余时间不足，已跳过可选价格搜索；未核实费用保留未知。')
+                elif budget.counts['search_calls'] < settings.max_search_calls and budget.counts['search_http_attempts'] < settings.max_search_http_attempts:
                     query = f'{trip.destination} {name} 门票价格 成人票 人均消费 人民币 官方 最新'
                     try:
+                        budget.phase = 'PRICE_SEARCH'
                         search = await adapters.search(query[:500])
                         evidence.update({h.id:h for h in search.results})
                         data['warnings'].extend(search.warnings)

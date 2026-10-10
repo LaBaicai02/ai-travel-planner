@@ -42,6 +42,7 @@ async def run_live(request: Request, trip: TripRequest, settings: Settings,
             raise ProviderError("budget", "TOTAL_TIMEOUT", "生成请求已超过总时限。", True)
         except ProviderError as exc:
             # Backend-owned counters only; never attach payloads or credentials.
+            exc.phase = getattr(budget, "phase", "STARTING")
             exc.call_counts = dict(budget.counts)
             exc.elapsed_ms = int((time.monotonic() - started) * 1000)
             raise
@@ -110,6 +111,12 @@ def create_app(settings: Settings | None = None, *, transport=None) -> FastAPI:
                 message = name + "请求超时" + detail + "。本次未完成生成；请保留请求编号排查，不建议连续重试。"
                 logger.warning("request_id=%s provider=%s error_code=UPSTREAM_TIMEOUT elapsed_ms=%s counts=%s",
                                request_id, provider, getattr(exc, "elapsed_ms", "unknown"), getattr(exc, "call_counts", {}))
+            if exc.code == "TOTAL_TIMEOUT":
+                phase = getattr(exc, "phase", "unknown")
+                if phase not in {"STARTING", "SEARCH_DECISION", "TRAVEL_SEARCH", "ITINERARY_GENERATION", "ITINERARY_REPAIR", "PRICE_SEARCH"}:
+                    phase = "unknown"
+                logger.warning("request_id=%s error_code=TOTAL_TIMEOUT phase=%s elapsed_ms=%s counts=%s",
+                               request_id, phase, getattr(exc, "elapsed_ms", "unknown"), getattr(exc, "call_counts", {}))
             return failure(exc.code, message, request_id, status, exc.retryable)
         except Exception:
             # Never return raw upstream errors, credentials, or a demo fallback.

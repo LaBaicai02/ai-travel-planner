@@ -58,12 +58,24 @@ class SegmentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_one_repair_shared_across_all_segments(self):
         fixture=Fixture(outputs=['bad JSON',segment(0,5),'bad JSON'])
+        # Isolate the one-repair contract with enough time for all three chunks.
+        settings=SETTINGS.model_copy(update={'trip_timeout_seconds':180})
+        budget=CallBudget(settings)
+        with self.assertRaises(ProviderError) as caught:
+            await self.run_fixture(fixture,budget=budget,settings=settings)
+        self.assertEqual(caught.exception.code,'INVALID_MODEL_OUTPUT')
+        self.assertEqual(budget.counts['model_calls'],4)
+        self.assertEqual(len([b for _,b in fixture.requests if 'response_format' in b]),3)
+
+    async def test_long_trip_core_repair_reserves_time_for_remaining_segments(self):
+        fixture=Fixture(outputs=['bad JSON'])
         budget=CallBudget(SETTINGS)
         with self.assertRaises(ProviderError) as caught:
             await self.run_fixture(fixture,budget=budget)
         self.assertEqual(caught.exception.code,'INVALID_MODEL_OUTPUT')
-        self.assertEqual(budget.counts['model_calls'],4)
-        self.assertEqual(len([b for _,b in fixture.requests if 'response_format' in b]),3)
+        self.assertIn('停止修复',caught.exception.message)
+        self.assertEqual(budget.counts['model_calls'],2)
+        self.assertEqual(len([b for _,b in fixture.requests if 'response_format' in b]),1)
 
     async def test_timeout_never_returns_partial_or_retries(self):
         fixture=Fixture(outputs=[segment(0,5)])
