@@ -26,6 +26,37 @@ def price_clues(hits):
     return clues
 
 
+def meal_gaps(trip, source_purposes):
+    """Count distinct source-backed dining stops in lunch/dinner windows.
+
+    Search purpose is a conservative hint, not verified venue classification.
+    Unknown opening hours are allowed; explicit closure/conflicts do not count.
+    """
+    gaps = []
+    for day in trip.days:
+        lunch, dinner = set(), set()
+        for activity in day.activities:
+            if not any('restaurant' in source_purposes.get(source.id, set()) for source in activity.sources):
+                continue
+            if not re.search(r'午餐|晚餐|用餐|就餐|享用|品尝|吃饭', activity.description):
+                continue
+            start, end = [int(t[:2]) * 60 + int(t[3:]) for t in activity.time.split(' - ')]
+            if end - start < 30:
+                continue
+            intervals = opening_intervals(activity.opening_hours, day.date)
+            if intervals is not None and not any(a <= start and end <= b for a, b in intervals):
+                continue
+            name = re.sub(r'\s+', '', activity.location).casefold()
+            if 11 * 60 <= start < 15 * 60:
+                lunch.add(name)
+            if 17 * 60 <= start < 22 * 60:
+                dinner.add(name)
+        if not lunch or not dinner or len(lunch | dinner) < 2:
+            gaps.append({'day': day.day, 'missing_lunch': not bool(lunch),
+                         'missing_dinner': not bool(dinner), 'distinct_restaurants': len(lunch | dinner)})
+    return gaps
+
+
 def annotate_plan(trip, source_purposes, mixed_interests=True):
     """Titles describe actual places; quality gaps remain visible without fake stops."""
     for day in trip.days:
@@ -40,6 +71,10 @@ def annotate_plan(trip, source_purposes, mixed_interests=True):
             trip.warnings.append(f'第 {day.day} 天的地点均来自餐厅类搜索，缺少已检索的观光安排；未编造景点补齐，请调整后再确认。')
         if mixed_interests and len(day.activities) < 3:
             trip.warnings.append(f'第 {day.day} 天只有 {len(day.activities)} 项有来源活动，安排较少；请核对是否符合旅行节奏。')
+    for gap in meal_gaps(trip, source_purposes):
+        missing = '、'.join(name for key, name in [('missing_lunch', '午餐'), ('missing_dinner', '晚餐')] if gap[key])
+        detail = '缺少有来源的' + missing + '安排' if missing else '午晚餐未覆盖两家不同餐厅'
+        trip.warnings.append(f"第 {gap['day']} 天{detail}，尚未达到每天至少两家餐厅的目标；未编造门店补齐，请补充确认。")
     trip.warnings.append('来源仅经搜索标题／摘要匹配，尚未核验网页正文、官方身份及具体分店；请以最新官方公告或门店确认为准。')
     trip.warnings = list(dict.fromkeys(trip.warnings))
     return trip
