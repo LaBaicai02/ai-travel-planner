@@ -82,12 +82,20 @@ class MealAgentTests(unittest.IsolatedAsyncioTestCase):
         def invalid(output):
             output['days'][0]['activities'][0]['source_ids']=['invented']
             return output
+        def wrong_branch(output):
+            output=meals(output)
+            output['days'][0]['activities'][1]['location']='梅园餐厅（虚构店）'
+            return output
+        def wrong_pair(output):
+            output=meals(output)
+            output['days'][0]['activities'][1]['source_ids']=output['days'][0]['activities'][2]['source_ids']
+            return output
         def invalid_first(output):
             output['days'][0]['activities'][0]['time']='99:00 - 99:30'
             return output
         outputs={'complete':[meals], 'repair':[lambda x:x,meals],
                  'invalid_repair':[lambda x:x,invalid], 'still_missing':[lambda x:x,lambda x:x],
-                 'core_repair':[invalid_first,lambda x:x], 'auth_repair':[lambda x:x]}
+                 'core_repair':[invalid_first,lambda x:x], 'auth_repair':[lambda x:x], 'wrong_branch':[lambda x:x,wrong_branch], 'wrong_pair':[lambda x:x,wrong_pair]}
         decisions=[tool_response([('food',{'query':'杭州 午餐 晚餐 两家餐厅 分店','purpose':'restaurant'}),
                                   ('sights',{'query':'杭州 西湖 景点','purpose':'attraction'})])]
         fixture=Fixture(decisions=decisions,outputs=outputs[mode]);original=fixture.handle
@@ -123,6 +131,11 @@ class MealAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(budget.counts['model_calls'],3)
         self.assertEqual(budget.counts['search_calls'],2)
         self.assertIn('餐次检查',json.dumps(fixture.requests[-1][1],ensure_ascii=False))
+        repair=fixture.requests[-1][1]
+        properties=repair['response_format']['json_schema']['schema']['$defs']['GroundedActivity']['properties']
+        self.assertEqual(set(properties['location']['enum']),{'西湖','梅园餐厅','湖畔饭店'})
+        self.assertIn('对应来源ID',repair['messages'][-1]['content'])
+        self.assertNotIn('tools',repair)
 
     async def test_no_restaurant_evidence_warns_without_inventing_or_retrying(self):
         trip,budget,_=await self.run_plan('still_missing',empty_restaurants=True)
@@ -138,6 +151,16 @@ class MealAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any('尚未达到' in w for w in trip.warnings))
         self.assertEqual(budget.counts['model_calls'],3)
         self.assertFalse(trip.demo)
+
+    async def test_fabricated_branch_or_wrong_valid_source_pair_never_accepted(self):
+        for mode in ['wrong_branch','wrong_pair']:
+            with self.subTest(mode=mode):
+                trip,budget,_=await self.run_plan(mode)
+                self.assertEqual([a.location for a in trip.days[0].activities],['西湖'])
+                self.assertTrue(any('餐厅补充输出未通过校验' in w for w in trip.warnings))
+                self.assertFalse(trip.demo)
+                self.assertEqual(budget.counts['model_calls'],3)
+                self.assertEqual(budget.counts['search_calls'],2)
 
     async def test_quality_repair_auth_failure_is_not_hidden_by_saved_draft(self):
         with self.assertRaises(ProviderError) as caught:

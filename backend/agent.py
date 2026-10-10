@@ -301,6 +301,8 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
         previous_locations = list(dict.fromkeys(a.location for d in combined for a in d.activities))
         instructions = {"segment_request": part.model_dump(mode="json"),
                         "previous_locations": previous_locations,
+                        "observed_place_candidates": _observed_candidates(None, part, evidence),
+                        "source_rule": "优先使用候选原名及其对应来源ID；没有候选的名称也必须逐字出现于引用标题或摘要，不猜别名、不添加分店后缀。",
                         "instructions": "只生成 segment_request 日期范围，day 从 1 开始。优先避免重复已有地点。每天合理安排，描述简短，不为凑数量添加活动。"}
         segment_messages = messages + [{"role": "user", "content": OUTPUT_RULES},
                                       {"role": "user", "content": json.dumps(instructions, ensure_ascii=False)}]
@@ -406,12 +408,14 @@ def _unknown_unverified_facts(output: GeneratedTrip, request: TripRequest,
     return candidate, warnings
 
 
-def _grounded_repair_model(output, request, evidence):
-    """Constrain repair to observed names; no aliases or invented source links."""
-    names = [a.location for d in output.days for a in d.activities]
+def _observed_candidates(output, request, evidence):
+    """Keep exact observed spellings, including branch suffixes, never aliases."""
+    names = [a.location for d in output.days for a in d.activities] if output else []
     for hit in evidence.values():
         name = re.sub(r"\s*(?:官方介绍|官方网站|官网|简介|介绍)$", "", hit.title).strip()
-        if len(name) <= 40 and re.search(r"寺|塔|公园|博物馆|景区|风景名胜区|风景区|巷子|古街|餐厅|饭店|酒楼|湖|山|园|楼|馆", name[-6:]) and not re.search(r"攻略|推荐|指南|回答|问答|合集|哪些|哪里|什么|[一二三四五六七八九十百\d]+[家个]", name):
+        # Recognize the venue before a branch suffix but retain the entire name.
+        stem = re.sub(r"[（(][^()（）]{1,30}[）)]$", "", name).strip()
+        if len(name) <= 40 and re.search(r"寺|塔|公园|博物馆|景区|风景名胜区|风景区|巷子|古街|餐厅|饭店|酒楼|湖|山|园|楼|馆", stem[-6:]) and not re.search(r"攻略|推荐|指南|回答|问答|合集|哪些|哪里|什么|暂停|歇业|闭店|停业|[一二三四五六七八九十百\d]+[家个]", name):
             names.append(name)
     candidates = {}
     for name in dict.fromkeys(names):
@@ -430,6 +434,12 @@ def _grounded_repair_model(output, request, evidence):
         except ProviderError:
             continue
         candidates[name] = ids
+    return candidates
+
+
+def _grounded_repair_model(output, request, evidence):
+    """Constrain repair to observed names; no aliases or invented source links."""
+    candidates = _observed_candidates(output, request, evidence)
     if not candidates:
         return None, candidates
     # Alibaba documents enum; emit enum even for one candidate (not const).
@@ -467,9 +477,13 @@ async def _generate_segment(request, adapters, evidence, messages, allow_repair,
             # Use the existing global repair allowance, never another search loop.
             if gaps and restaurant_sources >= 2 and attempt == 0 and allow_repair:
                 meal_fallback = (candidate, fact_warnings)
+                constrained, candidates = _grounded_repair_model(candidate, request, evidence)
+                if constrained is not None:
+                    output_model = constrained
                 messages.append(result.message)
                 messages.append({"role": "user", "content":
-                    "餐次检查：" + json.dumps(gaps, ensure_ascii=False) +
+                    "已检索候选地点与对应来源ID：" + json.dumps(candidates, ensure_ascii=False) +
+                    "。仅使用候选原名及其对应引用，不扩写店名、不猜分店。餐次检查：" + json.dumps(gaps, ensure_ascii=False) +
                     "。请只依据已有餐厅来源补齐每天两家不同门店的午餐和晚餐，保持不同天观光均衡。"
                     "每餐至少30分钟，安排不能重叠或落在已知闭馆/午休时间。价格可未知，不新增无来源门店。"
                     "重新输出完整行程JSON，不能调用工具。"})
