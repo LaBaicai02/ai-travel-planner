@@ -26,19 +26,21 @@ def price_clues(hits):
     return clues
 
 
-def meal_gaps(trip, source_purposes):
+def meal_gaps(trip, source_purposes, classifications=None):
     """Count distinct source-backed dining stops in lunch/dinner windows.
 
     Search purpose is a conservative hint, not verified venue classification.
     Unknown opening hours are allowed; explicit closure/conflicts do not count.
     """
+    classifications = classifications or {}
     gaps = []
     for day in trip.days:
         lunch, dinner = set(), set()
-        for activity in day.activities:
+        for index, activity in enumerate(day.activities):
             if not any('restaurant' in source_purposes.get(source.id, set()) for source in activity.sources):
                 continue
-            if not re.search(r'午餐|晚餐|用餐|就餐|享用|品尝|吃饭', activity.description):
+            activity_type, slot = classifications.get((day.day, index), (None, None))
+            if activity_type != 'dining' or slot not in {'lunch', 'dinner'}:
                 continue
             start, end = [int(t[:2]) * 60 + int(t[3:]) for t in activity.time.split(' - ')]
             if end - start < 30:
@@ -47,9 +49,9 @@ def meal_gaps(trip, source_purposes):
             if intervals is not None and not any(a <= start and end <= b for a, b in intervals):
                 continue
             name = re.sub(r'\s+', '', activity.location).casefold()
-            if 11 * 60 <= start < 15 * 60:
+            if slot == 'lunch' and 11 * 60 <= start < 15 * 60:
                 lunch.add(name)
-            if 17 * 60 <= start < 22 * 60:
+            if slot == 'dinner' and 17 * 60 <= start < 22 * 60:
                 dinner.add(name)
         if not lunch or not dinner or len(lunch | dinner) < 2:
             gaps.append({'day': day.day, 'missing_lunch': not bool(lunch),
@@ -57,7 +59,7 @@ def meal_gaps(trip, source_purposes):
     return gaps
 
 
-def annotate_plan(trip, source_purposes, mixed_interests=True):
+def annotate_plan(trip, source_purposes, mixed_interests=True, classifications=None):
     """Titles describe actual places; quality gaps remain visible without fake stops."""
     for day in trip.days:
         names = list(dict.fromkeys(a.location for a in day.activities))
@@ -71,7 +73,7 @@ def annotate_plan(trip, source_purposes, mixed_interests=True):
             trip.warnings.append(f'第 {day.day} 天的地点均来自餐厅类搜索，缺少已检索的观光安排；未编造景点补齐，请调整后再确认。')
         if mixed_interests and len(day.activities) < 3:
             trip.warnings.append(f'第 {day.day} 天只有 {len(day.activities)} 项有来源活动，安排较少；请核对是否符合旅行节奏。')
-    for gap in meal_gaps(trip, source_purposes):
+    for gap in meal_gaps(trip, source_purposes, classifications):
         missing = '、'.join(name for key, name in [('missing_lunch', '午餐'), ('missing_dinner', '晚餐')] if gap[key])
         detail = '缺少有来源的' + missing + '安排' if missing else '午晚餐未覆盖两家不同餐厅'
         trip.warnings.append(f"第 {gap['day']} 天{detail}，尚未达到每天至少两家餐厅的目标；未编造门店补齐，请补充确认。")
@@ -169,14 +171,15 @@ def opening_intervals(text, on_date=None):
     return selected[0] if len(selected) == 1 else None
 
 
-def improve_schedule(trip, source_purposes):
+def improve_schedule(trip, source_purposes, classifications=None):
     """Conservative, source-preserving corrections; no invented stops or charges."""
     from backend.schemas import TripResponse
     data = trip.model_dump()
     warnings = data['warnings']
     for day in data['days']:
         kept, seen_attractions = [], set()
-        for activity in day['activities']:
+        kept_types = []
+        for original_index, activity in enumerate(day['activities']):
             name = re.sub(r'\s+', '', activity['location']).casefold()
             attraction = any(source_purposes.get(s['id']) == {'attraction'} for s in activity['sources'])
             restaurant = any('restaurant' in source_purposes.get(s['id'], set()) for s in activity['sources'])
@@ -186,6 +189,13 @@ def improve_schedule(trip, source_purposes):
                     continue
                 seen_attractions.add(name)
             kept.append(activity)
+            if classifications is not None:
+                kept_types.append(classifications.get((day['day'], original_index), (None, None)))
+        if classifications is not None:
+            for key in list(classifications):
+                if key[0] == day['day']:
+                    del classifications[key]
+            classifications.update({(day['day'], i): kind for i, kind in enumerate(kept_types)})
         day['activities'] = kept
         previous_end = 0
         for index, activity in enumerate(kept):

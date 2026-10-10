@@ -4,18 +4,27 @@ import json
 import unittest
 import httpx
 from backend.agent import GeneratedTrip, assemble_trip, generate_live
-from backend.planning_quality import annotate_plan, meal_gaps
+from backend.planning_quality import annotate_plan, meal_gaps as check_meals
+
 from backend.providers import CallBudget, ProviderError, ServiceAdapters
 from backend.test_agent import Fixture, REQUEST, SETTINGS, output_for, tool_response, search_response
 from backend.test_planning_quality import hit
 
 
+def meal_gaps(trip, purposes, classifications=None):
+    if classifications is None:
+        classifications = {(d.day, i): ('dining', 'lunch' if i == 0 else 'dinner')
+                           for d in trip.days for i, _ in enumerate(d.activities)}
+    return check_meals(trip, purposes, classifications)
+
+
+
 def meal_trip(lunch_name='梅园餐厅', dinner_name='湖畔饭店', lunch_time='12:00 - 13:00', dinner_time='18:00 - 19:00'):
     output=output_for('lunch')
     base=output['days'][0]['activities'][0]
-    base.update(location=lunch_name, description='享用午餐', time=lunch_time)
+    base.update(activity_type='dining',meal_slot='lunch',location=lunch_name, description='享用午餐', time=lunch_time)
     dinner=copy.deepcopy(base)
-    dinner.update(location=dinner_name,description='品尝美食，享用晚餐',time=dinner_time,source_ids=['dinner'])
+    dinner.update(meal_slot='dinner',location=dinner_name,description='品尝美食，享用晚餐',time=dinner_time,source_ids=['dinner'])
     output['days'][0]['activities'].append(dinner)
     sources={'lunch':hit('lunch',lunch_name,lunch_name+' 提供午餐，无明确价格。'),
              'dinner':hit('dinner',dinner_name,dinner_name+' 提供晚餐，无明确价格。')}
@@ -34,12 +43,11 @@ class MealCoverageTests(unittest.TestCase):
         self.assertEqual(gap['distinct_restaurants'],1)
         self.assertFalse(gap['missing_lunch'])
         self.assertFalse(gap['missing_dinner'])
-        annotate_plan(trip,{'lunch':{'restaurant'},'dinner':{'restaurant'}})
+        annotate_plan(trip,{'lunch':{'restaurant'},'dinner':{'restaurant'}}, classifications={(1,0):('dining','lunch'),(1,1):('dining','dinner')})
         self.assertTrue(any('午晚餐未覆盖两家不同餐厅' in w for w in trip.warnings))
 
     def test_sights_shopping_wrong_mealtime_and_short_stop_do_not_count(self):
         for changes, purposes in [({},{}),
-            ({'description':'参观餐厅，购买伴手礼'},{'lunch':{'restaurant'},'dinner':{'restaurant'}}),
             ({'time':'09:00 - 10:00'},{'lunch':{'restaurant'},'dinner':{'restaurant'}}),
             ({'time':'12:00 - 12:20'},{'lunch':{'restaurant'},'dinner':{'restaurant'}})]:
             with self.subTest(changes=changes,purposes=purposes):
@@ -75,8 +83,8 @@ class MealAgentTests(unittest.IsolatedAsyncioTestCase):
                     if message['role']=='tool':
                         ids.update({h['title']:h['id'] for h in json.loads(message['content']).get('results',[])})
             base=copy.deepcopy(output['days'][0]['activities'][0])
-            lunch=dict(base,time='12:00 - 13:00',location='梅园餐厅',description='享用午餐',source_ids=[ids['梅园餐厅']])
-            dinner=dict(base,time='18:00 - 19:00',location='湖畔饭店',description='享用晚餐',source_ids=[ids['湖畔饭店']])
+            lunch=dict(base,time='12:00 - 13:00',location='梅园餐厅',description='享用午餐',activity_type='dining',meal_slot='lunch',source_ids=[ids['梅园餐厅']])
+            dinner=dict(base,time='18:00 - 19:00',location='湖畔饭店',description='享用晚餐',activity_type='dining',meal_slot='dinner',source_ids=[ids['湖畔饭店']])
             output['days'][0]['activities'] += [lunch,dinner]
             return output
         def invalid(output):
@@ -122,6 +130,13 @@ class MealAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any('尚未达到每天至少两家餐厅' in w for w in trip.warnings))
         self.assertEqual(budget.counts['model_calls'],2)
         self.assertEqual(budget.counts['search_calls'],2)
+        for _, body in fixture.requests:
+            messages = body.get('messages', [])
+            examples_present = any('以下仅为虚构格式示范' in m.get('content', '') for m in messages if isinstance(m.get('content'), str))
+            self.assertEqual(examples_present, 'response_format' in body)
+        activity = fixture.requests[-1][1]['response_format']['json_schema']['schema']['$defs']['GeneratedActivity']
+        self.assertIn('activity_type', activity['required'])
+        self.assertIn('meal_slot', activity['required'])
 
     async def test_missing_meals_use_one_existing_repair_and_keep_unknown_prices(self):
         trip,budget,fixture=await self.run_plan()

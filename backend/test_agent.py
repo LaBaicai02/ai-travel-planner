@@ -43,6 +43,7 @@ def search_response(empty=False):
 
 def output_for(source_id):
     return {"days": [{"day": 1, "date": "2026-10-10", "title": "西湖漫步", "activities": [{
+        "activity_type": "sightseeing", "meal_slot": None,
         "time": "09:00 - 10:00", "location": "西湖", "description": "建议游览，出发前核实",
         "estimated_cost": None, "cost_status": "unknown", "cost_basis": "", "cost_evidence": None,
         "source_ids": [source_id], "opening_hours": None, "opening_hours_status": "unknown",
