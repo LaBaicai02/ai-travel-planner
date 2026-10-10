@@ -12,3 +12,5 @@ main{max-width:1180px;margin:auto;padding:0 30px}.hero{display:flex;align-items:
 .result-heading>div,.day-heading>div{min-width:0}.result-heading h2{overflow-wrap:anywhere}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;scroll-behavior:auto!important}}
 .source-links,.plan-warnings{font-size:11px;line-height:1.8;padding-left:18px;overflow-wrap:anywhere}.source-links a{color:#196e56;text-decoration:underline}.source-links small{display:block;color:#738278}.activity .cost-basis,.activity .opening-hours{margin-top:8px}.known-cost,.stale-result{font-size:12px;color:#776737;overflow-wrap:anywhere}.cost-summary strong{overflow-wrap:anywhere}.error-banner button{margin-left:8px}.generate:disabled{opacity:.55;cursor:not-allowed}@media(max-width:400px){.cost-summary{gap:8px}.cost-summary strong{font-size:18px}.day-heading>strong{white-space:normal;max-width:110px}}
+
+.error-banner>div{min-width:0;overflow-wrap:anywhere}.error-details{font-size:10px;line-height:1.7;margin:7px 0 0}.demo-pill{flex-shrink:0}.header{gap:10px}@media(max-width:400px){.brand-sub,.brand-divider{display:none}}

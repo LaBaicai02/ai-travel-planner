@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { ArrowRight, Compass, MapPin, Sparkles, CalendarDays, Users, Wallet, Clock3, RotateCcw, LoaderCircle, AlertCircle, Leaf, Check, Route } from 'lucide-react'
 
 import type { Form, Health, Plan } from './types'
-import { currencyLabel, generatePlan, readHealth, safeSourceUrl } from './api'
+import { ApiError, currencyLabel, generatePlan, readHealth, safeSourceUrl } from './api'
 
 const interests = ['自然风光', '历史文化', '地道美食', '艺术展览', '城市漫步', '休闲购物']
 const today = () => { const date = new Date(); return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 10) }
@@ -17,7 +17,8 @@ export default function App() {
   const [checkingHealth, setCheckingHealth] = useState(false)
   const [plan, setPlan] = useState<Plan | null>(null)
   const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
+  const [error, setError] = useState<ApiError | null>(null)
+  const [stalePlan, setStalePlan] = useState(false)
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
   const resultRef = useRef<HTMLElement>(null)
   async function refreshHealth() {
@@ -33,8 +34,8 @@ export default function App() {
     } finally { setCheckingHealth(false) }
   }
   useEffect(() => { void refreshHealth() }, [])
-  const modeLabel = health ? health.mode === 'demo' ? '演示数据' : '真实模式 · 尚未接入' : '服务状态未知'
-  function update(key: keyof Form, value: string) { setForm(current => ({ ...current, [key]: value })); setFieldErrors(current => ({ ...current, [key]: '' })); setError('') }
+  const modeLabel = !health ? '服务状态未知' : health.mode === 'demo' ? '演示数据' : health.ready ? '真实模式 · AI 搜索辅助' : health.configured ? '真实模式 · 服务不可用' : '真实模式 · 配置未完成'
+  function update(key: keyof Form, value: string) { setForm(current => ({ ...current, [key]: value })); setFieldErrors(current => ({ ...current, [key]: '' })); setError(null) }
   async function generate(event?: FormEvent) {
     event?.preventDefault()
     if (loading || !health?.ready) return
@@ -46,15 +47,17 @@ export default function App() {
     }
     if (!Number.isFinite(Number(form.budget)) || Number(form.budget) <= 0 || Number(form.budget) > 10000000 || !/^\d+(\.\d{1,2})?$/.test(form.budget)) errors.budget = '预算须大于 0，不超过 1000 万，最多两位小数'
     if (!form.interests.length) errors.interests = '请至少选择一项兴趣偏好'
-    setFieldErrors(errors); setError('')
+    setFieldErrors(errors); setError(null)
     if (Object.keys(errors).length) return
     setLoading(true)
     try {
       const data = await generatePlan({ ...form, destination: form.destination.trim(), days: Number(form.days), travelers: Number(form.travelers), budget: form.budget }, health.mode)
       setPlan(data)
+      setStalePlan(false)
       window.setTimeout(() => resultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 80)
     } catch (err) {
-      setError(err instanceof Error ? err.message : '生成失败，请重试。')
+      setError(err instanceof ApiError ? err : new ApiError(err instanceof Error ? err.message : '生成失败，请重试。'))
+      if (plan) setStalePlan(true)
     } finally { setLoading(false) }
   }
   const fieldError = (name: string) => fieldErrors[name] ? <span id={name + '-error'} className="field-error">{fieldErrors[name]}</span> : null
@@ -81,16 +84,16 @@ export default function App() {
                 <div className="field"><label>兴趣偏好 <span>*</span><small>可多选</small></label><div className="interest-grid" role="group" aria-label="兴趣偏好">{interests.map(interest => <button key={interest} type="button" className={form.interests.includes(interest) ? 'interest selected' : 'interest'} aria-pressed={form.interests.includes(interest)} onClick={() => { setForm(current => ({ ...current, interests: current.interests.includes(interest) ? current.interests.filter(x => x !== interest) : [...current.interests, interest] })); setFieldErrors(current => ({ ...current, interests: '' })) }}>{interest}{form.interests.includes(interest) && <Check size={13} />}</button>)}</div>{fieldError('interests')}</div>
                 <button className="generate" type="submit" disabled={!health?.ready}>{loading ? <LoaderCircle size={18} className="spin" /> : <Sparkles size={18} />}{loading ? '正在编排你的旅程…' : plan ? '重新生成行程' : '生成我的行程'}{!loading && <ArrowRight size={17} />}</button>
               </fieldset>
-              {error && <div className="error-banner" role="alert"><AlertCircle size={18} /><div>{error}<button type="button" disabled={loading || !health?.ready} onClick={() => generate()}>重试生成</button></div></div>}
-              <p className="form-disclaimer">{health?.mode === 'demo' ? '演示数据 · 本阶段使用模拟行程，未接入 AI' : health?.message ?? '正在检查服务状态…'}</p>
+              {error && <div className="error-banner" role="alert"><AlertCircle size={18} /><div>{error.message}{error.details && <p className="error-details">错误代码：{error.details.code}<br />请求编号：{error.details.request_id}</p>}<button type="button" disabled={loading || !health?.ready} onClick={() => generate()}>重试生成</button></div></div>}
+              <p className="form-disclaimer">{health?.mode === 'demo' ? '演示数据 · 使用模拟行程，不调用 AI 或搜索服务' : health?.ready ? '真实模式 · 每次生成会调用 AI 与搜索服务，可能产生 API 费用。' : health?.message ?? '正在检查服务状态…'}</p>
             </form>
           </section>
           <section className="results" ref={resultRef} aria-live="polite" aria-busy={loading}>
-            {loading ? <div className="empty-state loading-state"><div className="empty-icon"><LoaderCircle size={38} className="spin" /></div><span className="eyebrow">让期待慢慢成形</span><h2>正在编排你的旅程</h2><p>结合目的地、预算和兴趣，为你整理每日安排。</p><div className="skeleton" /><div className="skeleton short" /></div> : plan ? <>
-              <div className="result-heading"><div><span className="eyebrow">YOUR TRAVEL PLAN · {plan.demo ? '演示数据' : '真实行程'}</span><h2>{plan.destination}，出发吧！</h2><p>{plan.days.length} 天 · {plan.travelers} 位旅客 · {plan.days[0].date} 出发</p></div><button type="button" className="regenerate" onClick={() => generate()} disabled={loading}><RotateCcw size={15} />重新生成</button></div>
+            {loading ? <div className="empty-state loading-state"><div className="empty-icon"><LoaderCircle size={38} className="spin" /></div><span className="eyebrow">让期待慢慢成形</span><h2>正在编排你的旅程</h2><p>{health?.mode === 'live' ? '正在检索旅行资料并生成行程，最多等待约两分钟，请勿重复提交。' : '结合目的地、预算和兴趣，为你整理每日安排。'}</p><div className="skeleton" /><div className="skeleton short" /></div> : plan ? <>
+              <div className="result-heading"><div><span className="eyebrow">YOUR TRAVEL PLAN · {plan.demo ? '演示数据' : '真实行程'}</span><h2>{plan.destination}，出发吧！</h2><p>{plan.days.length} 天 · {plan.travelers} 位旅客 · {plan.days[0].date} 出发</p></div><button type="button" className="regenerate" onClick={() => generate()} disabled={loading || !health?.ready}><RotateCcw size={15} />重新生成</button></div>
               <div className="cost-summary"><div><Wallet size={21} /><span>预计活动总费用<small>所有旅客合计</small></span></div><strong>{money(plan.total_cost, plan.currency)}</strong></div>
-              {plan.total_cost === null && <p className="known-cost">已知费用小计：{money(plan.known_cost_subtotal, plan.currency)}，不代表完整预算。</p>}
-              {error && <p className="stale-result">上次成功结果 · 本次重新生成失败，以下行程未更新。</p>}
+              {plan.total_cost === null && <p className="known-cost">已知费用小计：{money(plan.known_cost_subtotal, plan.currency)}，不代表完整费用。</p>}
+              {stalePlan && <p className="stale-result">上次成功结果 · 本次重新生成失败，以下行程未更新。</p>}
               <p className="result-notice">{plan.notice}</p>
               {plan.warnings.length > 0 && <ul className="plan-warnings">{plan.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul>}
               {plan.days.map(day => <article className="day-card" key={day.day}><div className="day-heading"><span className="day-number">{String(day.day).padStart(2, '0')}</span><div><h3>第 {day.day} 天 · {day.title}</h3><span>{day.date}</span></div><strong>{money(day.estimated_cost, plan.currency)}<small>{day.estimated_cost === null ? '已知小计 ' + money(day.known_cost_subtotal, plan.currency) : '当天合计'}</small></strong></div><div className="activities">{day.activities.map((activity, index) => <div className="activity" key={index}><span className="timeline-dot" /><div className="activity-time"><Clock3 size={12} />{activity.time}</div><div className="activity-info"><h4>{activity.location}</h4><p>{activity.description}</p><span className="activity-cost">{costLabel[activity.cost_status]}{activity.estimated_cost !== null && ' ' + money(activity.estimated_cost, plan.currency)} · 全体旅客</span>
