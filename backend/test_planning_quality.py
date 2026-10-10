@@ -3,7 +3,7 @@ import copy
 import json
 import unittest
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import httpx
 from backend.agent import GeneratedTrip, SearchArguments, assemble_trip, generate_live
 from backend.planning_quality import annotate_plan, price_clues, improve_schedule, opening_intervals
@@ -114,7 +114,7 @@ class ScheduleTests(unittest.TestCase):
 
     def test_seasonal_weekday_overnight_and_invalid_hours_not_guessed(self):
         for hours in ['夏令时4月-10月 07:30-18:30;冬令时08:00-17:30',
-                      '周一闭馆，周二至周日09:00-17:00', '22:00-02:00', '25:00-26:00']:
+                      '周一闭馆，周二至周日09:00-17:00（节假日例外）', '22:00-02:00', '25:00-26:00']:
             self.assertIsNone(opening_intervals(hours))
             result = improve_schedule(self.trip(['09:00 - 11:00'], hours), {'s1':{'attraction'}})
             self.assertEqual(result.days[0].activities[0].time,'09:00 - 11:00')
@@ -134,7 +134,107 @@ class ScheduleTests(unittest.TestCase):
         self.assertFalse(any('已缩短' in w for w in result.warnings))
 
 
+SEASONAL_HOURS = ('夏令时:4月1日-10月7日;开闭园时间:7:30-18:30。 '
+                  '冬令时:10月8日-次年3月31日;开闭园时间:8:00-17:30')
+
+
+class DateHoursTests(unittest.TestCase):
+    def test_seasonal_boundaries_and_cross_year(self):
+        for day, expected in [('2026-04-01',[(450,1110)]),('2026-10-07',[(450,1110)]),
+                              ('2026-10-08',[(480,1050)]),('2026-12-31',[(480,1050)]),
+                              ('2027-01-01',[(480,1050)]),('2027-03-31',[(480,1050)])]:
+            with self.subTest(day=day):
+                self.assertEqual(opening_intervals(SEASONAL_HOURS,date.fromisoformat(day)), expected)
+        self.assertIsNone(opening_intervals(SEASONAL_HOURS))
+
+    def test_weekday_closure_and_open_days(self):
+        hours = '周一闭馆，周二至周日09:00-17:00'
+        self.assertEqual(opening_intervals(hours,date(2026,10,12)),[])
+        for day in [13,18]:
+            self.assertEqual(opening_intervals(hours,date(2026,10,day)),[(540,1020)])
+        self.assertEqual(opening_intervals('星期五至星期一10:00-18:00',date(2026,10,12)),[(600,1080)])
+        self.assertIsNone(opening_intervals('星期五至星期一10:00-18:00',date(2026,10,13)))
+        self.assertEqual(opening_intervals('周天09:00-12:00',date(2026,10,18)),[(540,720)])
+
+    def test_split_meal_intervals_follow_weekday(self):
+        self.assertEqual(opening_intervals('周一至周五10:30-14:30,17:00-21:00；周六至周日11:00-20:00',
+                                          date(2026,10,12)),[(630,870),(1020,1260)])
+        self.assertEqual(opening_intervals('周一至周五10:30-14:30,17:00-21:00；周六至周日11:00-20:00',
+                                          date(2026,10,10)),[(660,1200)])
+
+    def test_ambiguous_overlapping_missing_and_invalid_clauses_stay_unknown(self):
+        for hours in ['4月1日-10月10日08:00-18:00；10月8日-次年3月31日09:00-17:00',
+                      '周一至周日09:00-17:00；周六10:00-16:00',
+                      '4月31日-10月7日09:00-17:00',
+                      '4月1日-次年10月7日09:00-17:00',
+                      '4月1日-10月7日09:00-17:00',
+                      '周一至周日09:00-17:00；节假日另行通知',
+                      '周一至周日09:00-17:00（法定节假日除外）',
+                      '周一至周日09:00-17:00；10月1日-10月7日08:00-18:00',
+                      '周一至周五09:00-17:00；周六25:00-26:00',
+                      '夏令时09:00-18:00；冬令时08:00-17:00']:
+            with self.subTest(hours=hours):
+                self.assertIsNone(opening_intervals(hours,date(2026,10,10)))
+
+    def test_leap_date_and_yearless_cross_year(self):
+        self.assertEqual(opening_intervals('2月29日-3月1日09:00-17:00',date(2028,2,29)),[(540,1020)])
+        self.assertIsNone(opening_intervals('2月30日-3月1日09:00-17:00',date(2028,2,29)))
+        self.assertEqual(opening_intervals('10月8日-3月31日08:00-17:30',date(2027,1,1)),[(480,1050)])
+
+    def test_trip_shortens_winter_hours_using_activity_day_and_preserves_evidence(self):
+        trip = ScheduleTests().trip(['07:30 - 18:00'],SEASONAL_HOURS)
+        result = improve_schedule(trip, {'s1':{'attraction'}})
+        self.assertEqual(result.days[0].date,date(2026,10,10))
+        self.assertEqual(result.days[0].activities[0].time,'08:00 - 17:30')
+        self.assertEqual(result.days[0].activities[0].opening_hours,SEASONAL_HOURS)
+        self.assertEqual(result.days[0].activities[0].sources,trip.days[0].activities[0].sources)
+        self.assertEqual(result.total_cost,trip.total_cost)
+        self.assertEqual(trip.days[0].activities[0].time,'07:30 - 18:00')
+        self.assertFalse(any('人工确认' in w for w in result.warnings))
+
+    def test_multiple_days_select_their_own_hours_and_closure_does_not_invent_a_time(self):
+        from backend.schemas import TripResponse
+        hours='周一闭馆，周二至周日09:00-17:00'
+        trip=ScheduleTests().trip(['08:00 - 18:00'],hours)
+        data=trip.model_dump()
+        data['days'][0]['date']=date(2026,10,12)
+        other=copy.deepcopy(data['days'][0]);other.update(day=2,date=date(2026,10,13))
+        data['days'].append(other)
+        trip=TripResponse.model_validate(data)
+        result=improve_schedule(trip,{'s1':{'attraction'}})
+        self.assertEqual(result.days[0].activities[0].time,'08:00 - 18:00')
+        self.assertEqual(result.days[1].activities[0].time,'09:00 - 17:00')
+        self.assertTrue(any('第 1 天第 1 项' in w and '当日闭馆' in w for w in result.warnings))
+        self.assertFalse(any('第 2 天' in w and '当日闭馆' in w for w in result.warnings))
+        self.assertEqual(result.total_cost,Decimal('80.00'))
+
+
 class PriceRoundtripTests(unittest.IsolatedAsyncioTestCase):
+    async def test_agent_uses_sourced_seasonal_hours_without_more_calls(self):
+        def seasonal(output):
+            output['days'][0]['activities'][0].update(time='07:30 - 18:00',
+                opening_hours=SEASONAL_HOURS,opening_hours_status='reported',
+                opening_hours_evidence=SEASONAL_HOURS)
+            return output
+        fixture=Fixture(decisions=[tool_response()],outputs=[seasonal])
+        original=fixture.handle
+        def handle(request):
+            if request.url.path.endswith('web-search'):
+                body=search_response()
+                body['data']['webPages']['value'][0]['summary']='西湖 '+SEASONAL_HOURS
+                return httpx.Response(200,json=body)
+            return original(request)
+        settings=SETTINGS.model_copy(update={'max_search_rounds':1,'max_search_calls':1})
+        budget=CallBudget(settings)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            trip=await generate_live(REQUEST,ServiceAdapters(settings,client,budget))
+        self.assertEqual(trip.days[0].activities[0].time,'08:00 - 17:30')
+        self.assertEqual(trip.days[0].activities[0].opening_hours,SEASONAL_HOURS)
+        self.assertFalse(trip.demo)
+        self.assertIsNone(trip.total_cost)
+        self.assertEqual(budget.counts['model_calls'],2)
+        self.assertEqual(budget.counts['search_calls'],1)
+
     async def test_native_price_tool_quotes_support_per_person_total(self):
         def known(output):
             tool=next(m for m in fixture.requests[-1][1]['messages'] if m['role']=='tool')

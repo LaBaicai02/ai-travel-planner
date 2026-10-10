@@ -1,5 +1,6 @@
 """Bounded presentation and search hints; no network or price invention."""
 import re
+from datetime import date
 
 MONEY_PATTERN = re.compile(r"[¥￥]\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?\s*元")
 PRICE_PATTERN = re.compile(r"[¥￥]\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?\s*元|免费|免票")
@@ -44,8 +45,8 @@ def annotate_plan(trip, source_purposes, mixed_interests=True):
     return trip
 
 
-def opening_intervals(text):
-    """Parse only plain daily intervals; conditional schedules need human review."""
+def _daily_intervals(text):
+    """Parse plain daytime intervals without inferring conditions."""
     if not text:
         return None
     text = text.strip()
@@ -66,6 +67,71 @@ def opening_intervals(text):
             return None
         intervals.append((start, end))
     return sorted(intervals)
+
+
+_WEEKDAY = {name: index for index, name in enumerate('一二三四五六日')}
+_WEEKDAY['天'] = 6
+_SEPARATOR = r'[-—–~～至]'
+_DATE_RANGE = re.compile(
+    r'(?:(?:夏令时|冬令时)\s*[:：]?\s*)?'
+    r'(\d{1,2})月(\d{1,2})日\s*' + _SEPARATOR + r'\s*(次年)?'
+    r'(\d{1,2})月(\d{1,2})日\s*[:：,，]?\s*'
+    r'(?:开闭园时间\s*[:：]\s*)?(.+)')
+_WEEK_RANGE = re.compile(
+    r'(?:周|星期)([一二三四五六日天])'
+    r'(?:\s*' + _SEPARATOR + r'\s*(?:周|星期)?([一二三四五六日天]))?'
+    r'\s*[:：]?\s*(.+)')
+
+
+def _inside(value, start, end):
+    return start <= value <= end if start <= end else value >= start or value <= end
+
+
+def opening_intervals(text, on_date=None):
+    """Resolve explicit recurring date/weekday clauses; unknown stays None.
+
+    [] means a stated closure on this date. None also covers gaps, conflicts,
+    exceptions, mixed conditions and overnight schedules; no holidays inferred.
+    """
+    daily = _daily_intervals(text)
+    if daily is not None or not text or on_date is None:
+        return daily
+    if not isinstance(on_date, date):
+        return None
+    # This exact label occurs in the supplied seasonal source excerpt.
+    normalized = re.sub(r'[;；]\s*开闭园时间\s*[:：]', ':', text.strip())
+    clauses = [part.strip() for part in re.split(r'[。;；]|[,，](?=(?:周|星期))', normalized) if part.strip()]
+    selected, family = [], None
+    for clause in clauses:
+        dates = _DATE_RANGE.fullmatch(clause)
+        weekdays = _WEEK_RANGE.fullmatch(clause)
+        if dates:
+            if family not in (None, 'date'):
+                return None
+            family = 'date'
+            m1, d1, next_year, m2, d2, hours = dates.groups()
+            try:
+                # A leap year validates month/day syntax, including February 29.
+                start, end = date(2000, int(m1), int(d1)), date(2000, int(m2), int(d2))
+            except ValueError:
+                return None
+            if next_year and end >= start:
+                return None  # Ambiguous multi-year span, not a recurring winter.
+            applicable = _inside((on_date.month, on_date.day), (start.month, start.day), (end.month, end.day))
+        elif weekdays:
+            if family not in (None, 'weekday'):
+                return None
+            family = 'weekday'
+            first, last, hours = weekdays.groups()
+            applicable = _inside(on_date.weekday(), _WEEKDAY[first], _WEEKDAY[last or first])
+        else:
+            return None  # Do not ignore an unrecognized exception clause.
+        intervals = [] if hours in {'闭馆', '闭园', '休息', '不开放'} else _daily_intervals(hours)
+        if intervals is None:
+            return None
+        if applicable:
+            selected.append(intervals)
+    return selected[0] if len(selected) == 1 else None
 
 
 def improve_schedule(trip, source_purposes):
@@ -92,8 +158,10 @@ def improve_schedule(trip, source_purposes):
                 h, m = map(int, value.split(':'))
                 return h * 60 + m
             start, end = map(minute, activity['time'].split(' - '))
-            intervals = opening_intervals(activity['opening_hours'])
-            if intervals is not None and not any(a <= start and end <= b for a, b in intervals):
+            intervals = opening_intervals(activity['opening_hours'], day['date'])
+            if intervals == []:
+                warnings.append(f"第 {day['day']} 天第 {index + 1} 项来源记载当日闭馆或不开放，未擅自改期，请更换活动或向官方核实。")
+            elif intervals is not None and not any(a <= start and end <= b for a, b in intervals):
                 # Shorten only to a usable overlap with the original suggestion.
                 overlaps = [(max(start, a, previous_end), min(end, b)) for a, b in intervals]
                 options = [(a, b) for a, b in overlaps if b - a >= 30]
@@ -104,7 +172,7 @@ def improve_schedule(trip, source_purposes):
                 else:
                     warnings.append(f"第 {day['day']} 天第 {index + 1} 项安排与来源营业时间冲突，无法安全自动调整，请改期或更换活动。")
             elif activity['opening_hours'] and intervals is None:
-                warnings.append(f"第 {day['day']} 天第 {index + 1} 项营业时间含条件或非标准格式，尚未自动核对日期与安排时间，请人工确认。")
+                warnings.append(f"第 {day['day']} 天第 {index + 1} 项营业时间条件不完整、相互冲突或格式暂不支持，无法确认当日时段，请人工确认。")
             previous_end = end
     data['warnings'] = [w for w in dict.fromkeys(warnings) if not w.startswith('行程包含重复地点')]
     locations = [re.sub(r'\s+', '', a['location']).casefold() for d in data['days'] for a in d['activities']]
