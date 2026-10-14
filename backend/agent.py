@@ -8,6 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model, model_validator
 
+from backend.place_candidates import explicit_names
 from backend.prompts import SYSTEM, SEARCH_POLICY, OUTPUT_RULES, GENERATION_EXAMPLES
 from backend.providers import ProviderError, ServiceAdapters
 from backend.planning_quality import annotate_plan, price_clues, improve_schedule, meal_gaps
@@ -288,6 +289,8 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
         raise ProviderError("search", "INSUFFICIENT_EVIDENCE", "没有获得可用旅行资料，请调整目的地或稍后重试。", True)
     catalog = _place_catalog(request, evidence)
     if not catalog:
+        logger.warning("request_id=%s error_code=INSUFFICIENT_EVIDENCE phase=CANDIDATE_EXTRACTION evidence_count=%s candidate_count=0 counts=%s",
+                       budget.request_id, len(evidence), budget.counts)
         raise ProviderError("search", "INSUFFICIENT_EVIDENCE", "搜索结果未形成可用的具体地点候选，已停止生成；请调整检索条件。", True)
     combined, repair_used = [], False
     for offset in range(0, request.days, 5):
@@ -409,11 +412,7 @@ def _observed_candidates(request, evidence):
     """Keep exact observed spellings, including branch suffixes, never aliases."""
     names = []
     for hit in evidence.values():
-        name = re.sub(r"\s*(?:官方介绍|官方网站|官网|简介|介绍)$", "", hit.title).strip()
-        # Recognize the venue before a branch suffix but retain the entire name.
-        stem = re.sub(r"[（(][^()（）]{1,30}[）)]$", "", name).strip()
-        if len(name) <= 40 and re.search(r"寺|塔|公园|博物馆|景区|风景名胜区|风景区|巷子|古街|餐厅|饭店|酒楼|湖|山|园|楼|馆", stem[-6:]) and not re.search(r"攻略|推荐|指南|回答|问答|合集|哪些|哪里|什么|暂停|歇业|闭店|停业|[一二三四五六七八九十百\d]+[家个]", name):
-            names.append(name)
+        names.extend(explicit_names(hit.title, hit.snippet))
     candidates = {}
     for name in dict.fromkeys(names):
         if len(candidates) >= 60:
