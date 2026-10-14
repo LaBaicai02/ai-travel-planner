@@ -3,6 +3,7 @@ import json
 import logging
 import re
 from backend.providers import ProviderError
+from backend.place_candidates import restaurant_discovery_query, screen_venue_results
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +15,7 @@ def coverage_counts(catalog, purposes):
         # Tool purpose is a hint; obvious sightseeing names cannot become meals.
         stem = re.sub(r'[（(][^()（）]{1,30}[）)]$', '', place['name']).strip()
         scenic = re.search(r'(?:博物馆|公园|景区|名胜区|风景区|古街|寺|塔|湖|山|城|桥|岛|泉|洞)$', stem)
-        if 'restaurant' in tags and not scenic:
+        if 'restaurant' in tags and (not scenic or place.get('dining_supported', False)):
             restaurants.add(pid)
         elif 'attraction' in tags:
             attractions.add(pid)
@@ -44,11 +45,11 @@ async def supplement_coverage(request, adapters, evidence, purposes, messages, w
             budget.remaining() < reserve + settings.search_timeout_seconds + 1):
             continue
         attempted.add(category)
-        query = (f'{request.destination} 旅行覆盖 具体餐厅 分店名称 午餐 晚餐 人均消费 营业时间' if category == 'restaurant' else
-                 f'{request.destination} 旅行覆盖 {request.days}天 不同景点 景点名称 官方 门票 开放时间')
+        query = (restaurant_discovery_query(request.destination) if category == 'restaurant' else
+                 f'{request.destination} 不同景点 官方名称 地址 开放时间')
         budget.phase = 'COVERAGE_SEARCH'
         try:
-            result = await adapters.search(query[:500])
+            result = screen_venue_results(await adapters.search(query[:500], freshness="oneYear" if category == "restaurant" else "noLimit"))
         except ProviderError as exc:
             if exc.code in {'AUTH_FAILED', 'QUOTA_EXHAUSTED', 'CONFIGURATION_ERROR', 'TOTAL_TIMEOUT', 'CALL_LIMIT'}:
                 raise

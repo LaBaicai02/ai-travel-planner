@@ -2,11 +2,12 @@
 import re
 from backend.price_estimates import compact, estimate_from_sources, EXCLUDED
 from backend.providers import ProviderError
+from backend.place_candidates import screen_venue_results, venue_source_usable
 from backend.schemas import Source, TripResponse
 
 
 def searched_price(activity, hits, travelers):
-    relevant = [h for h in hits if compact(activity['location']) in compact(h.title + ' ' + h.snippet)]
+    relevant = [h for h in hits if venue_source_usable(h.title) and compact(activity['location']) in compact(h.title + ' ' + h.snippet)]
     estimate = estimate_from_sources(activity['location'], relevant, travelers)
     if estimate:
         return estimate, [h for h in relevant if h.id in estimate['source_ids']], 'estimated'
@@ -49,7 +50,7 @@ async def complete_online_prices(trip, evidence, adapters):
                     query = f'{trip.destination} {name} 门票价格 成人票 人均消费 人民币 官方 最新'
                     try:
                         budget.phase = 'PRICE_SEARCH'
-                        search = await adapters.search(query[:500])
+                        search = screen_venue_results(await adapters.search(query[:500], freshness="oneYear"))
                         evidence.update({h.id:h for h in search.results})
                         data['warnings'].extend(search.warnings)
                     except ProviderError as exc:

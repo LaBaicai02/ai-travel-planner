@@ -9,7 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model, model_validator
 
 from backend.trip_coverage import supplement_coverage, require_candidates, coverage_counts, deficits, distinct_daily_choices
-from backend.place_candidates import explicit_names
+from backend.place_candidates import explicit_names, screen_venue_results, venue_source_usable, restaurant_discovery_query, dining_context
 from backend.prompts import SYSTEM, SEARCH_POLICY, OUTPUT_RULES, GENERATION_EXAMPLES
 from backend.providers import ProviderError, ServiceAdapters
 from backend.planning_quality import annotate_plan, price_clues, improve_schedule, meal_gaps
@@ -260,7 +260,9 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
                     warnings.append("为行程生成与校验预留时间，已跳过部分搜索；资料可能不完整。")
                 else:
                     budget.phase = "TRAVEL_SEARCH"
-                    search = await adapters.search(arguments.query)
+                    query = restaurant_discovery_query(request.destination, arguments.query) if arguments.purpose == "restaurant" else arguments.query
+                    freshness = "oneYear" if arguments.purpose in {"restaurant", "opening_hours", "price"} else "noLimit"
+                    search = screen_venue_results(await adapters.search(query, freshness=freshness))
                     evidence.update({hit.id: hit for hit in search.results})
                     for hit in search.results:
                         source_purposes.setdefault(hit.id, set()).add(arguments.purpose)
@@ -438,6 +440,7 @@ def _unknown_unverified_facts(output: GeneratedTrip, request: TripRequest,
 
 def _observed_candidates(request, evidence):
     """Keep exact observed spellings, including branch suffixes, never aliases."""
+    evidence = {sid: hit for sid, hit in evidence.items() if venue_source_usable(hit.title)}
     names = []
     for hit in evidence.values():
         names.extend(explicit_names(hit.title, hit.snippet))
@@ -463,7 +466,8 @@ def _observed_candidates(request, evidence):
 
 def _place_catalog(request, evidence):
     """Request-local IDs from observed titles; no model names or alias merging."""
-    return {f"place_{i}": {"name": name, "source_ids": ids}
+    return {f"place_{i}": {"name": name, "source_ids": ids,
+                             "dining_supported": any(dining_context(evidence[sid].title, evidence[sid].snippet) for sid in ids)}
             for i, (name, ids) in enumerate(_observed_candidates(request, evidence).items(), 1)}
 
 

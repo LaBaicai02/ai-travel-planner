@@ -245,14 +245,16 @@ class ServiceAdapters:
                 raise ProviderError(provider, "TOTAL_TIMEOUT", "重试等待超过总时限。", True) from None
         raise AssertionError("unreachable")
 
-    async def search(self, query: str) -> SearchResult:
+    async def search(self, query: str, *, freshness: str = "noLimit") -> SearchResult:
+        if freshness not in {"noLimit", "oneDay", "oneWeek", "oneMonth", "oneYear"}:
+            raise ProviderError("search", "INVALID_ARGUMENT", "搜索时间范围无效。")
         if not isinstance(query, str) or not query.strip() or len(query.strip()) > 500:
             raise ProviderError("search", "INVALID_ARGUMENT", "搜索文本必须为 1–500 个字符。")
         query = query.strip()
         body = await self._post(
             "search", self.settings.bocha_base_url.rstrip("/") + "/v1/web-search",
             self.settings.bocha_api_key.get_secret_value(),
-            {"query": query, "freshness": "noLimit", "summary": True, "count": 5},
+            {"query": query, "freshness": freshness, "summary": True, "count": 5},
         )
         try:
             items = body["data"]["webPages"]["value"]

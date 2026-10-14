@@ -10,7 +10,7 @@ def with_multi_coverage(fixture):
     original = fixture.handle
     def handle(request):
         body = json.loads(request.content)
-        if request.url.path.endswith('web-search') and '旅行覆盖 具体餐厅' in body['query']:
+        if request.url.path.endswith('web-search') and '餐厅 门店 地址 电话' in body['query']:
             fixture.requests.append((request.url.path, body))
             return httpx.Response(200, json={'code':200, 'data':{'webPages':{'value':[
                 {'name': name, 'url':f'https://food.example/{i}', 'summary':f'{name}人均消费10元，提供午餐和晚餐。'}

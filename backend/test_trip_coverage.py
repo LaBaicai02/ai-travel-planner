@@ -47,6 +47,8 @@ class TripCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any('尚未达到每天至少两家餐厅' in w for w in trip.warnings))
         self.assertEqual(budget.counts['model_calls'],2)
         self.assertEqual(budget.counts['search_calls'],2)
+        searches = [b for path,b in fixture.requests if path.endswith('web-search')]
+        self.assertEqual([b['freshness'] for b in searches],['noLimit','oneYear'])
         messages = fixture.requests[-1][1]['messages']
         extra = [json.loads(m['content']) for m in messages if m['role']=='user' and m['content'].startswith('{')]
         self.assertTrue(any('backend_coverage_evidence' in x for x in extra))
@@ -90,7 +92,7 @@ class TripCoverageTests(unittest.IsolatedAsyncioTestCase):
     async def test_auth_failure_in_coverage_search_is_never_hidden(self):
         fixture=Fixture(); original=fixture.handle
         def handle(request):
-            if request.url.path.endswith('web-search') and '旅行覆盖' in json.loads(request.content)['query']:
+            if request.url.path.endswith('web-search') and '餐厅 门店 地址 电话' in json.loads(request.content)['query']:
                 return httpx.Response(401,json={})
             return original(request)
         fixture.handle=handle
