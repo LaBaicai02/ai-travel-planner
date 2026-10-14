@@ -50,6 +50,28 @@ def output_for(source_id):
         "opening_hours_evidence": None}]}]}
 
 
+def select_places(content, body):
+    """Adapt legacy test builders to the wire contract, never production output."""
+    if not isinstance(content, dict):
+        return content
+    catalog = {}
+    for message in body.get('messages', []):
+        if message['role'] == 'user':
+            try:
+                catalog.update(json.loads(message['content']).get('place_catalog', {}))
+            except (ValueError, AttributeError):
+                pass
+    content = copy.deepcopy(content)
+    for day in content.get('days', []):
+        for activity in day.get('activities', []):
+            if 'place_id' in activity:
+                continue
+            name, ids = activity.pop('location', None), activity.pop('source_ids', [])
+            activity['place_id'] = next((pid for pid, p in catalog.items()
+                if p['name'] == name and ids and set(ids) <= set(p['source_ids'])), 'unregistered_place')
+    return content
+
+
 class Fixture:
     def __init__(self, decisions=None, outputs=None, search_status=200, empty=False):
         self.decisions = list(decisions if decisions is not None else [tool_response(), text_response("资料足够")])
@@ -71,6 +93,7 @@ class Fixture:
         content = self.outputs.pop(0) if self.outputs else output_for(self.source_id)
         if callable(content):
             content = content(output_for(self.source_id))
+        content = select_places(content, body)
         return httpx.Response(200, json=text_response(content if isinstance(content, str) else json.dumps(content)))
 
 

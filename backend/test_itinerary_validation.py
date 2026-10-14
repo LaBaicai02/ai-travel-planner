@@ -112,10 +112,10 @@ class RepairTests(unittest.IsolatedAsyncioTestCase):
         fixture = Fixture(outputs=[wrong])
         async with httpx.AsyncClient(transport=httpx.MockTransport(fixture.handle)) as client:
             adapter = ServiceAdapters(SETTINGS, client)
-            with self.assertLogs('backend.agent', level='WARNING'):
+            with self.assertLogs('backend.providers', level='WARNING'):
                 trip = await generate_live(REQUEST, adapter)
         self.assertNotEqual(trip.days[0].activities[0].location, REQUEST.destination)
-        self.assertIn('location_generic', fixture.requests[-1][1]['messages'][-1]['content'])
+        self.assertIn('place_id', fixture.requests[-1][1]['messages'][-1]['content'])
         self.assertNotIn('tools', fixture.requests[-1][1])
         self.assertEqual(adapter.budget.counts['model_calls'], 4)
         self.assertEqual(adapter.budget.counts['search_calls'], 1)
@@ -161,10 +161,10 @@ class RepairTests(unittest.IsolatedAsyncioTestCase):
         fixture=Fixture(outputs=[wrong,wrong])
         async with httpx.AsyncClient(transport=httpx.MockTransport(fixture.handle)) as client:
             adapter=ServiceAdapters(SETTINGS,client)
-            with self.assertLogs('backend.agent',level='WARNING'),self.assertRaises(ProviderError) as caught:
+            with self.assertLogs('backend.providers',level='WARNING'),self.assertRaises(ProviderError) as caught:
                 await generate_live(REQUEST,adapter)
         self.assertIn('OUTPUT_SCHEMA',caught.exception.message)
-        self.assertIn('source_ids',caught.exception.message)
+        self.assertIn('place_id',caught.exception.message)
         self.assertNotIn('PRIVATE-VALUE',caught.exception.message)
         self.assertEqual(adapter.budget.counts['model_calls'],4)
 

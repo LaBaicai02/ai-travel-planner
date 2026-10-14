@@ -4,7 +4,7 @@ import unittest
 
 from pydantic import ValidationError
 
-from backend.agent import GeneratedTrip, _classifications, assemble_trip
+from backend.agent import GeneratedTrip, _classifications, assemble_trip, _place_output_model, _bind_places, _place_catalog
 from backend.planning_quality import meal_gaps, improve_schedule
 from backend.prompts import EXAMPLES, GENERATION_EXAMPLES
 from backend.providers import ProviderError
@@ -17,7 +17,10 @@ class OutputConstraintsTests(unittest.TestCase):
         self.assertEqual(len(EXAMPLES), 3)
         self.assertLessEqual(len(GENERATION_EXAMPLES), 4000)
         for example in EXAMPLES:
-            parsed = GeneratedTrip.model_validate(example['output'])
+            selection = _place_output_model(example['place_catalog']).model_validate(example['output'])
+            parsed = _bind_places(selection, example['place_catalog'])
+            with self.assertRaises(ValidationError):
+                _place_output_model(_place_catalog(REQUEST, evidence())).model_validate(example['output'])
             request = REQUEST.model_copy(update={'departure_date': date(2030, 1, 1)})
             with self.assertRaises(ProviderError) as caught:
                 assemble_trip(parsed, request, evidence(), 'example-check', [])

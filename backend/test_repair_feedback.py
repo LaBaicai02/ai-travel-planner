@@ -80,7 +80,11 @@ class FeedbackTests(unittest.TestCase):
 
 class FeedbackRoundtripTests(unittest.IsolatedAsyncioTestCase):
     async def test_single_repair_gets_both_errors_no_additional_tools(self):
-        fixture=Fixture(outputs=[broken])
+        def invalid_schedule(output):
+            output['days'][0]['date']='2026-10-11'
+            output['days'][0]['activities'][0]['time']='99:00 - 99:30'
+            return output
+        fixture=Fixture(outputs=[invalid_schedule])
         settings=SETTINGS.model_copy(update={'max_search_rounds':1,'max_model_calls':3})
         budget=CallBudget(settings)
         async with httpx.AsyncClient(transport=httpx.MockTransport(fixture.handle)) as client:
@@ -88,10 +92,10 @@ class FeedbackRoundtripTests(unittest.IsolatedAsyncioTestCase):
                 trip=await generate_live(REQUEST,ServiceAdapters(settings,client,budget))
         repair=fixture.requests[-1][1]
         feedback=repair['messages'][-1]['content']
-        self.assertIn('cost_zero_unsupported',feedback)
-        self.assertIn('location_unsupported',feedback)
-        self.assertIn('days.0.activities.1.location',feedback)
-        self.assertIn('cost_status',feedback)
+        self.assertIn('day_date',feedback)
+        self.assertIn('time_invalid',feedback)
+        self.assertIn('days.0.activities.0.time',feedback)
+        self.assertIn('place_id',feedback)
         self.assertNotIn('PRIVATE-UNSUPPORTED-PLACE',feedback)
         self.assertNotIn('PRIVATE-UNSUPPORTED-PLACE',''.join(logs.output))
         self.assertNotIn('tools',repair)
@@ -108,11 +112,11 @@ class FeedbackRoundtripTests(unittest.IsolatedAsyncioTestCase):
         settings=SETTINGS.model_copy(update={'max_search_rounds':1,'max_model_calls':3})
         budget=CallBudget(settings)
         async with httpx.AsyncClient(transport=httpx.MockTransport(fixture.handle)) as client:
-            with self.assertLogs('backend.agent',level='WARNING'),self.assertRaises(ProviderError) as caught:
+            with self.assertLogs('backend.providers',level='WARNING'),self.assertRaises(ProviderError) as caught:
                 await generate_live(REQUEST,ServiceAdapters(settings,client,budget))
         self.assertEqual(caught.exception.code,'INVALID_MODEL_OUTPUT')
         self.assertIn('OUTPUT_SCHEMA',caught.exception.message)
-        self.assertIn('location',caught.exception.message)
+        self.assertIn('place_id',caught.exception.message)
         self.assertEqual(budget.counts['model_calls'],3)
         self.assertNotIn('PRIVATE-UNSUPPORTED-PLACE',caught.exception.message)
 

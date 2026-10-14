@@ -28,7 +28,7 @@ class SearchArguments(StrictOutput):
     purpose: Literal["attraction", "restaurant", "opening_hours", "price"]
 
 
-class GeneratedActivity(StrictOutput):
+class ActivityFacts(StrictOutput):
     activity_type: Literal["sightseeing", "dining", "shopping", "other"]
     meal_slot: Literal["lunch", "dinner"] | None
 
@@ -39,16 +39,20 @@ class GeneratedActivity(StrictOutput):
         return self
 
     time: str = Field(pattern=r"^\d{2}:\d{2} - \d{2}:\d{2}$")
-    location: str = Field(min_length=1, max_length=120)
     description: str = Field(min_length=1, max_length=1000)
     estimated_cost: str | None = Field(pattern=r"^\d{1,8}\.\d{2}$")
     cost_status: Literal["reference", "estimated", "unknown"]
     cost_basis: str = Field(max_length=500)
     cost_evidence: str | None = Field(max_length=500)
-    source_ids: list[str] = Field(min_length=1, max_length=5)
     opening_hours: str | None = Field(max_length=200)
     opening_hours_status: Literal["reported", "unknown"]
     opening_hours_evidence: str | None = Field(max_length=500)
+
+
+class GeneratedActivity(ActivityFacts):
+    """Backend-bound activity, never the provider's free-form place selection."""
+    location: str = Field(min_length=1, max_length=120)
+    source_ids: list[str] = Field(min_length=1, max_length=5)
 
 
 class GeneratedDay(StrictOutput):
@@ -282,19 +286,23 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
             break
     if not evidence:
         raise ProviderError("search", "INSUFFICIENT_EVIDENCE", "没有获得可用旅行资料，请调整目的地或稍后重试。", True)
+    catalog = _place_catalog(request, evidence)
+    if not catalog:
+        raise ProviderError("search", "INSUFFICIENT_EVIDENCE", "搜索结果未形成可用的具体地点候选，已停止生成；请调整检索条件。", True)
     combined, repair_used = [], False
     for offset in range(0, request.days, 5):
         part = request.model_copy(update={"days": min(5, request.days - offset),
                                          "departure_date": request.departure_date + timedelta(days=offset)})
-        previous_locations = list(dict.fromkeys(a.location for d in combined for a in d.activities))
+        used_names = {a.location for d in combined for a in d.activities}
+        previous_place_ids = [pid for pid, place in catalog.items() if place["name"] in used_names]
         instructions = {"segment_request": part.model_dump(mode="json"),
-                        "previous_locations": previous_locations,
-                        "observed_place_candidates": _observed_candidates(None, part, evidence),
-                        "source_rule": "优先使用候选原名及其对应来源ID；没有候选的名称也必须逐字出现于引用标题或摘要，不猜别名、不添加分店后缀。",
+                        "previous_place_ids": previous_place_ids,
+                        "place_catalog": catalog,
+                        "source_rule": "只选择候选place_id，名称和来源由后端绑定；价格和营业引文仅取该候选对应来源。",
                         "instructions": "只生成 segment_request 日期范围，day 从 1 开始。优先避免重复已有地点。每天合理安排，描述简短，不为凑数量添加活动。"}
         segment_messages = messages + [{"role": "system", "content": OUTPUT_RULES + "\n" + GENERATION_EXAMPLES},
                                       {"role": "user", "content": json.dumps(instructions, ensure_ascii=False)}]
-        parsed, repaired, fact_warnings = await _generate_segment(part, adapters, evidence, segment_messages, not repair_used, source_purposes, chunk_count - offset // 5 - 1)
+        parsed, repaired, fact_warnings = await _generate_segment(part, adapters, evidence, segment_messages, not repair_used, source_purposes, chunk_count - offset // 5 - 1, catalog)
         warnings.extend((f"第 {offset + 1}–{offset + part.days} 天：" + warning) if chunk_count > 1 else warning for warning in fact_warnings)
         repair_used = repair_used or repaired
         combined.extend(day.model_copy(update={"day": offset + index + 1}) for index, day in enumerate(parsed.days))
@@ -397,9 +405,9 @@ def _unknown_unverified_facts(output: GeneratedTrip, request: TripRequest,
     return candidate, warnings
 
 
-def _observed_candidates(output, request, evidence):
+def _observed_candidates(request, evidence):
     """Keep exact observed spellings, including branch suffixes, never aliases."""
-    names = [a.location for d in output.days for a in d.activities] if output else []
+    names = []
     for hit in evidence.values():
         name = re.sub(r"\s*(?:官方介绍|官方网站|官网|简介|介绍)$", "", hit.title).strip()
         # Recognize the venue before a branch suffix but retain the entire name.
@@ -426,26 +434,35 @@ def _observed_candidates(output, request, evidence):
     return candidates
 
 
-def _grounded_repair_model(output, request, evidence):
-    """Constrain repair to observed names; no aliases or invented source links."""
-    candidates = _observed_candidates(output, request, evidence)
-    if not candidates:
-        return None, candidates
-    # Alibaba documents enum; emit enum even for one candidate (not const).
-    def location_schema(schema):
+def _place_catalog(request, evidence):
+    """Request-local IDs from observed titles; no model names or alias merging."""
+    return {f"place_{i}": {"name": name, "source_ids": ids}
+            for i, (name, ids) in enumerate(_observed_candidates(request, evidence).items(), 1)}
+
+
+def _place_output_model(catalog):
+    def place_schema(schema):
         schema.pop("const", None)
-        schema["enum"] = list(candidates)
-    def sources_schema(schema):
-        schema["items"].pop("const", None)
-        schema["items"]["enum"] = list(evidence)
-    activity_model = create_model("GroundedActivity", __base__=GeneratedActivity,
-        location=(Literal[tuple(candidates)], Field(json_schema_extra=location_schema)),
-        source_ids=(list[Literal[tuple(evidence)]], Field(min_length=1, max_length=5, json_schema_extra=sources_schema)))
-    day_model = create_model("GroundedDay", __base__=GeneratedDay,
-        activities=(list[activity_model], Field(min_length=1, max_length=12)))
-    trip_model = create_model("GroundedTrip", __base__=GeneratedTrip,
-        days=(list[day_model], Field(min_length=1, max_length=14)))
-    return trip_model, candidates
+        schema["enum"] = list(catalog)
+    activity = create_model("SelectedActivity", __base__=ActivityFacts,
+        place_id=(Literal[tuple(catalog)], Field(json_schema_extra=place_schema)))
+    day = create_model("SelectedDay", __base__=GeneratedDay,
+        activities=(list[activity], Field(min_length=1, max_length=12)))
+    return create_model("SelectedTrip", __base__=StrictOutput,
+        days=(list[day], Field(min_length=1, max_length=14)))
+
+
+def _bind_places(selection, catalog):
+    data = selection.model_dump()
+    for day in data["days"]:
+        for activity in day["activities"]:
+            place_id = activity.pop("place_id")
+            if place_id not in catalog:
+                raise _output_error()
+            place = catalog[place_id]
+            activity.update(location=place["name"], source_ids=list(place["source_ids"]))
+    return GeneratedTrip.model_validate(data)
+
 
 
 def _classifications(output):
@@ -454,19 +471,23 @@ def _classifications(output):
             for day in output.days for index, activity in enumerate(day.activities)}
 
 
-async def _generate_segment(request, adapters, evidence, messages, allow_repair, source_purposes=None, remaining_chunks=0):
+async def _generate_segment(request, adapters, evidence, messages, allow_repair, source_purposes=None, remaining_chunks=0, catalog=None):
     """Validate each segment; one repair allowance is shared by the whole trip."""
-    output_model = GeneratedTrip
+    catalog = catalog if catalog is not None else _place_catalog(request, evidence)
+    if not catalog:
+        raise ProviderError("search", "INSUFFICIENT_EVIDENCE", "没有可用的具体地点候选，已停止生成。", True)
+    output_model = _place_output_model(catalog)
     source_purposes = source_purposes or {}
     meal_fallback = None
     for attempt in range(2 if allow_repair else 1):
-        result = None
+        result, bound = None, None
         try:
             adapters.budget.phase = "ITINERARY_GENERATION" if attempt == 0 else "ITINERARY_REPAIR"
             result = await adapters.complete(messages, output_model=output_model)
-            if not isinstance(result.parsed, GeneratedTrip):
+            if not isinstance(result.parsed, output_model):
                 raise _output_error()
-            candidate, fact_warnings = _unknown_unverified_facts(result.parsed, request, evidence)
+            bound = _bind_places(result.parsed, catalog)
+            candidate, fact_warnings = _unknown_unverified_facts(bound, request, evidence)
             validated = assemble_trip(candidate, request, evidence, adapters.budget.request_id, [])
             gaps = meal_gaps(validated, source_purposes, _classifications(candidate))
             restaurant_sources = sum('restaurant' in purposes for purposes in source_purposes.values())
@@ -475,13 +496,9 @@ async def _generate_segment(request, adapters, evidence, messages, allow_repair,
                 if adapters.budget.remaining() < adapters.settings.llm_timeout_seconds * (remaining_chunks + 1) + 1:
                     return candidate, False, fact_warnings + ["剩余时间优先用于完成行程，已跳过可选餐次补充；餐次缺口请确认。"]
                 meal_fallback = (candidate, fact_warnings)
-                constrained, candidates = _grounded_repair_model(candidate, request, evidence)
-                if constrained is not None:
-                    output_model = constrained
                 messages.append(result.message)
                 messages.append({"role": "user", "content":
-                    "已检索候选地点与对应来源ID：" + json.dumps(candidates, ensure_ascii=False) +
-                    "。仅使用候选原名及其对应引用，不扩写店名、不猜分店。餐次检查：" + json.dumps(gaps, ensure_ascii=False) +
+                    "仅选择已有候选place_id，使用后端绑定的名称与来源。餐次检查：" + json.dumps(gaps, ensure_ascii=False) +
                     "。请只依据已有餐厅来源补齐每天两家不同门店的午餐和晚餐，保持不同天观光均衡。"
                     "每餐至少30分钟，安排不能重叠或落在已知闭馆/午休时间。价格可未知，不新增无来源门店。"
                     "重新输出完整行程JSON，不能调用工具。"})
@@ -501,20 +518,13 @@ async def _generate_segment(request, adapters, evidence, messages, allow_repair,
                 # Invalid core output is never returned as a successful itinerary.
                 exc.message += " 剩余时间不足以预留完整修复窗口，已停止修复，未返回无效行程。"
                 raise
-            if result is not None and isinstance(result.parsed, GeneratedTrip):
+            if result is not None:
                 # Retain only in request memory and the model conversation, never logs.
                 messages.append(result.message)
-            issues = _repair_issues(result.parsed, request, evidence, exc) if result is not None and isinstance(result.parsed, GeneratedTrip) else []
+            issues = _repair_issues(bound, request, evidence, exc) if bound is not None else []
             feedback = " 本轮逐项检查：" + json.dumps(issues, ensure_ascii=False) if issues else ""
-            if result is not None and isinstance(result.parsed, GeneratedTrip):
-                constrained, candidates = _grounded_repair_model(result.parsed, request, evidence)
-                if constrained is not None:
-                    output_model = constrained
-                    feedback += " 只能选择以下已通过名称匹配的候选地点，不改写名称；对应来源 ID 为：" + json.dumps(candidates, ensure_ascii=False)
-                elif any(issue["check"] in {"location_unsupported", "location_generic"} for issue in issues):
-                    raise ProviderError("search", "INSUFFICIENT_EVIDENCE", "检索资料与模型地点无法匹配，且没有可用的已校验候选地点；已停止继续修复，请调整检索条件。", True) from None
             specific = ""
             if any(issue["check"] in {"cost_quote_missing", "cost_price_missing", "reference_price_mismatch", "cost_zero_unsupported"} for issue in issues):
                 specific = " 对失败活动重新检查价格原文；无法在对应地点来源中确认时，将 estimated_cost、cost_evidence 设 null，cost_status 设 unknown，cost_basis 设空字符串。不要只改引文措辞或自行推算价格。"
-            messages.append({"role": "user", "content": "后端校验反馈：" + exc.message + feedback + specific + " 请重新依据已有资料输出完整 JSON，必须提供 Schema 中所有必填字段。金额为两位小数字符串，未知必须显式填 null；cost_basis 未知时填空字符串。核对日期、天数、时间顺序、已登记来源 ID、地点原文、费用和营业时间证据。无法证实的费用及营业时间设为未知。逐项修复全部检查，不要修改已经有来源支持的地点名称；删除无法获得具体地点证据的活动，仍需每天至少一项有证据的活动，否则不能生成成功行程。不得调用工具。"})
+            messages.append({"role": "user", "content": "后端校验反馈：" + exc.message + feedback + specific + " 请重新依据已有资料输出完整 JSON，必须提供 Schema 中所有必填字段。金额为两位小数字符串，未知必须显式填 null；cost_basis 未知时填空字符串。核对日期、天数、时间顺序、候选place_id、费用和营业时间证据。无法证实的费用及营业时间设为未知。逐项修复全部检查，只选候选表内place_id；删除无法获得具体地点证据的活动，仍需每天至少一项有证据的活动，否则不能生成成功行程。不得调用工具。"})
     raise AssertionError("unreachable")

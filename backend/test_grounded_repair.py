@@ -1,120 +1,97 @@
-"""Constrained repair must use observed places and registered source IDs."""
+"""Native place-ID output: candidate scope, binding and bounded repair."""
+import copy
 import json
 import unittest
 import httpx
-from backend.agent import GeneratedTrip, _grounded_repair_model, _observed_candidates, generate_live
+from pydantic import ValidationError
+from backend.agent import (_place_catalog, _place_output_model, _bind_places, assemble_trip, generate_live)
 from backend.providers import CallBudget, ProviderError, ServiceAdapters
 from backend.test_agent import REQUEST, SETTINGS, Fixture, output_for
 from backend.test_itinerary_validation import evidence
+from backend.test_planning_quality import hit
+
+
+def selected(place_id='place_1'):
+    output = output_for('s1')
+    activity = output['days'][0]['activities'][0]
+    activity.pop('location'); activity.pop('source_ids')
+    activity['place_id'] = place_id
+    return output
 
 
 class CandidateTests(unittest.TestCase):
-    def test_observed_title_name_is_candidate_but_fake_alias_is_not(self):
-        output=output_for('s1');output['days'][0]['activities'][0]['location']='PRIVATE-ALIAS'
-        model,candidates=_grounded_repair_model(GeneratedTrip.model_validate(output),REQUEST,evidence())
-        self.assertEqual(candidates,{'西湖':['s1']})
-        schema=model.model_json_schema()
-        activity=schema['$defs']['GroundedActivity']
-        self.assertEqual(activity['properties']['location']['enum'],['西湖'])
-        self.assertEqual(activity['properties']['source_ids']['items']['enum'],['s1'])
+    def test_schema_exposes_only_place_id_and_backend_binds_name_sources(self):
+        e = evidence(); catalog = _place_catalog(REQUEST, e)
+        model = _place_output_model(catalog)
+        activity = model.model_json_schema()['$defs']['SelectedActivity']
+        self.assertEqual(activity['properties']['place_id']['enum'], ['place_1'])
+        self.assertNotIn('const', activity['properties']['place_id'])
+        self.assertNotIn('location', activity['properties'])
+        self.assertNotIn('source_ids', activity['properties'])
         self.assertFalse(activity['additionalProperties'])
-        self.assertIsInstance(model.model_validate(output_for('s1')),GeneratedTrip)
-        with self.assertRaises(ValueError):model.model_validate(output)
+        bound = _bind_places(model.model_validate(selected()), catalog)
+        trip = assemble_trip(bound, REQUEST, e, 'test', [])
+        public = trip.model_dump(mode='json')['days'][0]['activities'][0]
+        self.assertEqual(public['location'], '西湖')
+        self.assertEqual(public['sources'][0]['id'], 's1')
+        self.assertNotIn('place_id', public)
+        for output in [selected('invented'), selected('example_view'), output_for('s1')]:
+            with self.assertRaises(ValidationError): model.model_validate(output)
+        for field, value in [('location', '伪造地点'), ('source_ids', ['other'])]:
+            output = selected(); output['days'][0]['activities'][0][field] = value
+            with self.assertRaises(ValidationError): model.model_validate(output)
 
-    def test_no_candidate_from_generic_article_or_city(self):
-        e=evidence();e['s1']=e['s1'].model_copy(update={'title':'杭州6家地道杭帮菜推荐','snippet':'没有对应地点原文'})
-        output=output_for('s1');output['days'][0]['activities'][0]['location']='PRIVATE-ALIAS'
-        model,candidates=_grounded_repair_model(GeneratedTrip.model_validate(output),REQUEST,e)
-        self.assertIsNone(model)
-        self.assertEqual(candidates,{})
+    def test_branches_remain_distinct_and_titles_are_conservative(self):
+        names = ['品味餐厅（庆春路店）', '品味餐厅（湖滨店）']
+        e = {f's{i}': hit(f's{i}', name, name) for i, name in enumerate(names)}
+        self.assertEqual([p['name'] for p in _place_catalog(REQUEST, e).values()], names)
+        for title in ['杭州', '附近餐厅', '杭州6家地道杭帮菜推荐', '品味餐厅（暂停营业）', '景点攻略']:
+            self.assertEqual(_place_catalog(REQUEST, {'s': hit('s', title, '西湖、梅园餐厅')}), {})
+        e = {f's{i}': hit(f's{i}', f'测试{i}餐厅', f'测试{i}餐厅') for i in range(80)}
+        self.assertEqual(len(_place_catalog(REQUEST, e)), 60)
 
-    def test_branch_suffix_keeps_exact_full_name_and_rejects_alias(self):
-        e=evidence();e['s1']=e['s1'].model_copy(update={'title':'品味餐厅（庆春路店）',
-            'snippet':'品味餐厅（庆春路店）提供午餐与晚餐。'})
-        output=output_for('s1');output['days'][0]['activities'][0]['location']='品味餐厅庆春店'
-        model,candidates=_grounded_repair_model(GeneratedTrip.model_validate(output),REQUEST,e)
-        self.assertEqual(candidates,{'品味餐厅（庆春路店）':['s1']})
-        self.assertEqual(_observed_candidates(None,REQUEST,e),candidates)
-        with self.assertRaises(ValueError):model.model_validate(output)
-
-    def test_parenthesized_recommendation_or_closed_titles_not_candidates(self):
-        for title in ['杭州6家餐厅（庆春路店）','地道餐厅推荐（庆春路店）','品味餐厅（暂停营业）']:
-            e=evidence();e['s1']=e['s1'].model_copy(update={'title':title,'snippet':'综合资料'})
-            self.assertEqual(_observed_candidates(None,REQUEST,e),{})
+    def test_other_place_quotes_cannot_supply_price_or_hours(self):
+        e = {'s1': hit('s1', '梅园餐厅', '梅园餐厅提供用餐，价格未知'),
+             's2': hit('s2', '湖畔饭店', '湖畔饭店人均80元，营业时间10:00-20:00')}
+        catalog = _place_catalog(REQUEST, e); model = _place_output_model(catalog)
+        for fields, reason in [
+            ({'estimated_cost':'160.00','cost_status':'reference','cost_basis':'2人每人80元','cost_evidence':'湖畔饭店人均80元'}, 'cost_quote_missing'),
+            ({'opening_hours':'10:00-20:00','opening_hours_status':'reported','opening_hours_evidence':'湖畔饭店人均80元，营业时间10:00-20:00'}, 'hours_quote_missing')]:
+            output = selected(); output['days'][0]['activities'][0].update(fields)
+            bound = _bind_places(model.model_validate(output), catalog)
+            with self.assertRaises(ProviderError) as caught: assemble_trip(bound, REQUEST, e, 'test', [])
+            self.assertEqual(caught.exception.validation_reason, reason)
 
 
 class CandidateRoundtripTests(unittest.IsolatedAsyncioTestCase):
-    async def test_wrong_place_repaired_with_enum_and_no_extra_search(self):
-        def wrong(output):
-            output['days'][0]['activities'][0]['location']='PRIVATE-ALIAS'
-            return output
-        fixture=Fixture(outputs=[wrong])
-        settings=SETTINGS.model_copy(update={'max_search_rounds':1,'max_model_calls':3})
-        budget=CallBudget(settings)
+    async def test_invalid_id_repaired_with_same_enum_without_more_search(self):
+        fixture = Fixture(outputs=[selected('PRIVATE-ID'), selected()])
+        settings = SETTINGS.model_copy(update={'max_search_rounds':1,'max_model_calls':3})
+        budget = CallBudget(settings)
         async with httpx.AsyncClient(transport=httpx.MockTransport(fixture.handle)) as client:
-            with self.assertLogs('backend.agent',level='WARNING') as logs:
-                trip=await generate_live(REQUEST,ServiceAdapters(settings,client,budget))
-        self.assertEqual(trip.days[0].activities[0].location,'西湖')
-        repair=fixture.requests[-1][1]
-        schema=repair['response_format']['json_schema']['schema']
-        self.assertEqual(schema['$defs']['GroundedActivity']['properties']['location']['enum'],['西湖'])
-        self.assertIn('西湖',repair['messages'][-1]['content'])
-        self.assertNotIn('PRIVATE-ALIAS',repair['messages'][-1]['content'])
-        self.assertNotIn('PRIVATE-ALIAS',''.join(logs.output))
-        self.assertNotIn('tools',repair)
-        self.assertEqual(budget.counts['model_calls'],3)
-        self.assertEqual(budget.counts['search_calls'],1)
+            with self.assertLogs('backend.providers', level='WARNING') as logs:
+                trip = await generate_live(REQUEST, ServiceAdapters(settings,client,budget))
+        generated = [b for _,b in fixture.requests if 'response_format' in b]
+        self.assertEqual(generated[0]['response_format'], generated[1]['response_format'])
+        self.assertNotIn('PRIVATE-ID', ''.join(logs.output))
+        self.assertNotIn('PRIVATE-ID', generated[1]['messages'][-1]['content'])
+        self.assertEqual(trip.days[0].activities[0].location, '西湖')
+        self.assertEqual(budget.counts['model_calls'], 3)
+        self.assertEqual(budget.counts['search_calls'], 1)
 
-    async def test_wrong_branch_name_repaired_to_exact_observed_branch(self):
-        def wrong(output):
-            output['days'][0]['activities'][0]['location']='品味餐厅庆春店'
-            return output
-        def correct(output):
-            output['days'][0]['activities'][0]['location']='品味餐厅（庆春路店）'
-            return output
-        fixture=Fixture(outputs=[wrong,correct]);original=fixture.handle
+    async def test_no_candidates_stops_before_any_generation(self):
+        fixture = Fixture(); original = fixture.handle
         def handle(request):
-            response=original(request)
+            response = original(request)
             if request.url.path.endswith('web-search'):
-                body=response.json();row=body['data']['webPages']['value'][0]
-                row.update(name='品味餐厅（庆春路店）',summary='品味餐厅（庆春路店）提供午餐和晚餐，价格未知。')
+                body=response.json(); body['data']['webPages']['value'][0].update(name='景点攻略与推荐',summary='没有可用的具体地点资料')
                 return httpx.Response(200,json=body)
             return response
-        settings=SETTINGS.model_copy(update={'max_search_rounds':1,'max_model_calls':3,'max_search_calls':1})
-        budget=CallBudget(settings)
+        settings = SETTINGS.model_copy(update={'max_search_rounds':1})
+        budget = CallBudget(settings)
         async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
-            with self.assertLogs('backend.agent',level='WARNING'):
-                trip=await generate_live(REQUEST,ServiceAdapters(settings,client,budget))
-        self.assertEqual(trip.days[0].activities[0].location,'品味餐厅（庆春路店）')
-        generated=[b for _,b in fixture.requests if 'response_format' in b]
-        initial=json.loads(generated[0]['messages'][-1]['content'])
-        self.assertEqual(list(initial['observed_place_candidates']),['品味餐厅（庆春路店）'])
-        enum=generated[1]['response_format']['json_schema']['schema']['$defs']['GroundedActivity']['properties']['location']['enum']
-        self.assertEqual(enum,['品味餐厅（庆春路店）'])
-        self.assertEqual(budget.counts['model_calls'],3)
-        self.assertEqual(budget.counts['search_calls'],1)
-
-    async def test_no_candidates_stop_before_paid_repair(self):
-        def wrong(output):
-            output['days'][0]['activities'][0]['location']='PRIVATE-ALIAS'
-            return output
-        fixture=Fixture(outputs=[wrong]);original=fixture.handle
-        def handle(request):
-            response=original(request)
-            if request.url.path.endswith('web-search'):
-                body=response.json();hit=body['data']['webPages']['value'][0]
-                hit.update(name='景点攻略与推荐',summary='没有可用的具体地点资料')
-                return httpx.Response(200,json=body)
-            return response
-        settings=SETTINGS.model_copy(update={'max_search_rounds':1,'max_model_calls':3})
-        budget=CallBudget(settings)
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
-            with self.assertLogs('backend.agent',level='WARNING'),self.assertRaises(ProviderError) as caught:
+            with self.assertRaises(ProviderError) as caught:
                 await generate_live(REQUEST,ServiceAdapters(settings,client,budget))
         self.assertEqual(caught.exception.code,'INSUFFICIENT_EVIDENCE')
-        self.assertEqual(budget.counts['model_calls'],2)
-        self.assertEqual(budget.counts['search_calls'],1)
-        self.assertNotIn('PRIVATE-ALIAS',caught.exception.message)
-
-
-if __name__ == '__main__':unittest.main()
+        self.assertEqual(budget.counts['model_calls'],1)
+        self.assertFalse(any('response_format' in b for _,b in fixture.requests))

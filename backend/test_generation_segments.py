@@ -44,7 +44,7 @@ class SegmentTests(unittest.IsolatedAsyncioTestCase):
                     instruction=json.loads(b['messages'][-1]['content'])
                     self.assertEqual(instruction['segment_request']['days'],min(5,count-i*5))
                     self.assertEqual(instruction['segment_request']['departure_date'],(REQUEST.departure_date+timedelta(days=i*5)).isoformat())
-                    self.assertEqual(instruction['previous_locations'],[] if i==0 else ['西湖'])
+                    self.assertEqual(instruction['previous_place_ids'],[] if i==0 else ['place_1'])
                     self.assertNotIn('tools',b)
 
     async def test_small_budget_rejected_before_paid_search(self):

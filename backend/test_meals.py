@@ -134,7 +134,7 @@ class MealAgentTests(unittest.IsolatedAsyncioTestCase):
             messages = body.get('messages', [])
             examples_present = any('以下仅为虚构格式示范' in m.get('content', '') for m in messages if isinstance(m.get('content'), str))
             self.assertEqual(examples_present, 'response_format' in body)
-        activity = fixture.requests[-1][1]['response_format']['json_schema']['schema']['$defs']['GeneratedActivity']
+        activity = fixture.requests[-1][1]['response_format']['json_schema']['schema']['$defs']['SelectedActivity']
         self.assertIn('activity_type', activity['required'])
         self.assertIn('meal_slot', activity['required'])
 
@@ -147,9 +147,11 @@ class MealAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(budget.counts['search_calls'],2)
         self.assertIn('餐次检查',json.dumps(fixture.requests[-1][1],ensure_ascii=False))
         repair=fixture.requests[-1][1]
-        properties=repair['response_format']['json_schema']['schema']['$defs']['GroundedActivity']['properties']
-        self.assertEqual(set(properties['location']['enum']),{'西湖','梅园餐厅','湖畔饭店'})
-        self.assertIn('对应来源ID',repair['messages'][-1]['content'])
+        properties=repair['response_format']['json_schema']['schema']['$defs']['SelectedActivity']['properties']
+        self.assertEqual(set(properties['place_id']['enum']),{'place_1','place_2','place_3'})
+        self.assertNotIn('location',properties)
+        self.assertNotIn('source_ids',properties)
+        self.assertIn('候选place_id',repair['messages'][-1]['content'])
         self.assertNotIn('tools',repair)
 
     async def test_no_restaurant_evidence_warns_without_inventing_or_retrying(self):

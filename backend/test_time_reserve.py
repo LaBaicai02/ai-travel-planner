@@ -40,7 +40,10 @@ class TimeReserveTests(unittest.IsolatedAsyncioTestCase):
         budget = CallBudget(SETTINGS, clock=lambda: now[0])
         def handle(request):
             now[0] = 90
-            return httpx.Response(200, json=text_response(json.dumps(output_for('s1'))))
+            output = output_for('s1')
+            activity = output['days'][0]['activities'][0]
+            activity.pop('location'); activity.pop('source_ids'); activity['place_id'] = 'place_1'
+            return httpx.Response(200, json=text_response(json.dumps(output)))
         e = evidence()
         e.update({'r1': hit('r1', '梅园餐厅', '梅园餐厅'), 'r2': hit('r2', '湖畔饭店', '湖畔饭店')})
         async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
@@ -56,6 +59,8 @@ class TimeReserveTests(unittest.IsolatedAsyncioTestCase):
         now = [0]
         budget = CallBudget(SETTINGS, clock=lambda: now[0])
         output = output_for('invented')
+        activity = output['days'][0]['activities'][0]
+        activity.pop('location'); activity.pop('source_ids'); activity['place_id'] = 'invented'
         def handle(request):
             now[0] = 90
             return httpx.Response(200, json=text_response(json.dumps(output)))
