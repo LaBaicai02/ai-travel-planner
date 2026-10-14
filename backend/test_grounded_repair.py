@@ -46,7 +46,7 @@ class CandidateTests(unittest.TestCase):
         e = {f's{i}': hit(f's{i}', name, name) for i, name in enumerate(names)}
         self.assertEqual([p['name'] for p in _place_catalog(REQUEST, e).values()], names)
         for title in ['杭州', '附近餐厅', '杭州6家地道杭帮菜推荐', '品味餐厅（暂停营业）', '景点攻略']:
-            self.assertEqual(_place_catalog(REQUEST, {'s': hit('s', title, '西湖、梅园餐厅')}), {})
+            self.assertEqual(_place_catalog(REQUEST, {'s': hit('s', title, '没有明确名称的普通说明')}), {})
         e = {f's{i}': hit(f's{i}', f'测试{i}餐厅', f'测试{i}餐厅') for i in range(80)}
         self.assertEqual(len(_place_catalog(REQUEST, e)), 60)
 
