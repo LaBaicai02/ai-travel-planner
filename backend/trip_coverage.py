@@ -77,7 +77,7 @@ def require_candidates(request, catalog, purposes, budget=None):
             '本次时间或搜索预算内未补齐，已停止生成，未返回重复地点凑成的完整行程。', True)
 
 
-def distinct_daily_choices(days):
+def matched_daily_choices(days):
     """Each day must have an independent sightseeing choice (bounded matching)."""
     owner = {}
     def assign(day, seen):
@@ -89,4 +89,40 @@ def distinct_daily_choices(days):
                 owner[name] = day
                 return True
         return False
-    return all(assign(day, set()) for day in range(len(days)))
+    return sum(assign(day, set()) for day in range(len(days)))
+
+
+def distinct_daily_choices(days):
+    return matched_daily_choices(days) == len(days)
+
+
+def schedule_coverage_gaps(trip, purposes, classifications, catalog, needs_sights):
+    """Shared generation/repair/final checks; diagnostics contain no source text."""
+    from backend.planning_quality import meal_gaps
+    attractions, restaurants = coverage_counts(catalog, purposes)
+    restaurant_names = {catalog[pid]['name'] for pid in restaurants}
+    meal_classes = dict(classifications)
+    for day in trip.days:
+        for index, activity in enumerate(day.activities):
+            if activity.location not in restaurant_names:
+                meal_classes[(day.day, index)] = ('other', None)
+    meals = meal_gaps(trip, purposes, meal_classes)
+    attraction_names = {catalog[pid]['name'] for pid in attractions}
+    daily_sights = [{a.location for i, a in enumerate(day.activities)
+                     if a.location in attraction_names and
+                     classifications.get((day.day, i), (None, None))[0] == 'sightseeing'}
+                    for day in trip.days]
+    missing_sight_days = len(trip.days) - matched_daily_choices(daily_sights) if needs_sights else 0
+    return {'meals': meals, 'missing_independent_sight_days': missing_sight_days} if meals or missing_sight_days else {}
+
+
+def coverage_gap_message(gaps):
+    details = []
+    for gap in gaps.get('meals', []):
+        slots = [label for key, label in [('missing_lunch', '午餐'), ('missing_dinner', '晚餐')] if gap[key]]
+        detail = '、'.join(slots) if slots else '两家不同餐厅'
+        details.append(f"第{gap['day']}天缺少合格的{detail}")
+    missing = gaps.get('missing_independent_sight_days', 0)
+    if missing:
+        details.append(f'还需为{missing}天安排可独立匹配的不同景点')
+    return '；'.join(details)

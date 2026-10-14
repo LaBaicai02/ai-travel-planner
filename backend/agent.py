@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model, model_validator
 
-from backend.trip_coverage import supplement_coverage, require_candidates, coverage_counts, deficits, distinct_daily_choices
+from backend.trip_coverage import supplement_coverage, require_candidates, coverage_counts, deficits, schedule_coverage_gaps, coverage_gap_message
 from backend.place_candidates import explicit_names, screen_venue_results, venue_source_usable, restaurant_discovery_query, dining_context
 from backend.prompts import SYSTEM, SEARCH_POLICY, OUTPUT_RULES, GENERATION_EXAMPLES
 from backend.providers import ProviderError, ServiceAdapters
@@ -314,7 +314,7 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
                         "instructions": "只生成 segment_request 日期范围，day 从 1 开始。优先避免重复已有地点。每天合理安排，描述简短，不为凑数量添加活动。"}
         segment_messages = messages + [{"role": "system", "content": OUTPUT_RULES + "\n" + GENERATION_EXAMPLES},
                                       {"role": "user", "content": json.dumps(instructions, ensure_ascii=False)}]
-        parsed, repaired, fact_warnings = await _generate_segment(part, adapters, evidence, segment_messages, not repair_used, source_purposes, chunk_count - offset // 5 - 1, catalog)
+        parsed, repaired, fact_warnings = await _generate_segment(part, adapters, evidence, segment_messages, not repair_used, source_purposes, chunk_count - offset // 5 - 1, catalog, request.days > 1)
         warnings.extend((f"第 {offset + 1}–{offset + part.days} 天：" + warning) if chunk_count > 1 else warning for warning in fact_warnings)
         repair_used = repair_used or repaired
         combined.extend(day.model_copy(update={"day": offset + index + 1}) for index, day in enumerate(parsed.days))
@@ -325,21 +325,13 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
     trip = improve_schedule(trip, source_purposes, classifications)
     trip = annotate_plan(trip, source_purposes, any(i != "地道美食" for i in request.interests), classifications)
     if request.days > 1:
-        attraction_ids, restaurant_ids = coverage_counts(catalog, source_purposes)
-        restaurant_names = {catalog[pid]["name"] for pid in restaurant_ids}
-        meal_classes = {key: value for key, value in classifications.items()}
-        for day in trip.days:
-            for index, activity in enumerate(day.activities):
-                if activity.location not in restaurant_names:
-                    meal_classes[(day.day, index)] = ("other", None)
-        meal_missing = meal_gaps(trip, source_purposes, meal_classes)
-        attraction_names = {catalog[pid]["name"] for pid in attraction_ids}
-        needs_sights = any(i != "地道美食" for i in request.interests)
-        daily_sights = [{a.location for i, a in enumerate(d.activities) if a.location in attraction_names
-                         and classifications.get((d.day, i), (None, None))[0] == "sightseeing"} for d in trip.days]
-        if meal_missing or (needs_sights and not distinct_daily_choices(daily_sights)):
-            logger.warning("request_id=%s error_code=ITINERARY_COVERAGE_MISSING phase=FINAL_COVERAGE counts=%s", budget.request_id, budget.counts)
-            raise ProviderError("model", "ITINERARY_COVERAGE_MISSING", "生成结果未达到多日行程最低覆盖：每天需午晚餐两家餐厅，观光行程每天需不同景点。已停止返回重复或缺餐的行程，请核对搜索覆盖与预算。", True)
+        gaps = schedule_coverage_gaps(trip, source_purposes, classifications, catalog,
+                                      any(i != "地道美食" for i in request.interests))
+        if gaps:
+            logger.warning("request_id=%s error_code=ITINERARY_COVERAGE_MISSING phase=FINAL_COVERAGE gaps=%s counts=%s", budget.request_id, gaps, budget.counts)
+            raise ProviderError("model", "ITINERARY_COVERAGE_MISSING",
+                "生成结果未达到多日行程最低覆盖：" + coverage_gap_message(gaps) +
+                "。本次修复或时间预算内未补齐，未返回缺餐或重复景点凑成的行程。", True)
     trip = await complete_online_prices(trip, evidence, adapters)
     # Preserve internal activity intent through price checks, then render neutral text.
     for day in trip.days:
@@ -502,7 +494,7 @@ def _classifications(output):
             for day in output.days for index, activity in enumerate(day.activities)}
 
 
-async def _generate_segment(request, adapters, evidence, messages, allow_repair, source_purposes=None, remaining_chunks=0, catalog=None):
+async def _generate_segment(request, adapters, evidence, messages, allow_repair, source_purposes=None, remaining_chunks=0, catalog=None, coverage_required=False):
     """Validate each segment; one repair allowance is shared by the whole trip."""
     catalog = catalog if catalog is not None else _place_catalog(request, evidence)
     if not catalog:
@@ -520,17 +512,21 @@ async def _generate_segment(request, adapters, evidence, messages, allow_repair,
             bound = _bind_places(result.parsed, catalog)
             candidate, fact_warnings = _unknown_unverified_facts(bound, request, evidence)
             validated = assemble_trip(candidate, request, evidence, adapters.budget.request_id, [])
-            gaps = meal_gaps(validated, source_purposes, _classifications(candidate))
+            classes = _classifications(candidate)
+            checked = improve_schedule(validated, source_purposes, classes) if coverage_required else validated
+            gaps = (schedule_coverage_gaps(checked, source_purposes, classes, catalog,
+                    any(i != "地道美食" for i in request.interests)) if coverage_required else
+                    meal_gaps(checked, source_purposes, classes))
             restaurant_sources = sum('restaurant' in purposes for purposes in source_purposes.values())
             # Use the existing global repair allowance, never another search loop.
-            if gaps and restaurant_sources >= 2 and attempt == 0 and allow_repair:
+            if gaps and (coverage_required or restaurant_sources >= 2) and attempt == 0 and allow_repair:
                 if adapters.budget.remaining() < adapters.settings.llm_timeout_seconds * (remaining_chunks + 1) + 1:
-                    return candidate, False, fact_warnings + ["剩余时间优先用于完成行程，已跳过可选餐次补充；餐次缺口请确认。"]
+                    return candidate, False, fact_warnings + (["剩余时间优先用于完成行程，已跳过覆盖修复；最终仍需通过覆盖检查。"] if coverage_required else ["剩余时间优先用于完成行程，已跳过可选餐次补充；餐次缺口请确认。"])
                 meal_fallback = (candidate, fact_warnings)
                 messages.append(result.message)
                 messages.append({"role": "user", "content":
-                    "仅选择已有候选place_id，使用后端绑定的名称与来源。餐次检查：" + json.dumps(gaps, ensure_ascii=False) +
-                    "。请只依据已有餐厅来源补齐每天两家不同门店的午餐和晚餐，保持不同天观光均衡。"
+                    "仅选择已有候选place_id，使用后端绑定的名称与来源。行程覆盖／餐次检查：" + json.dumps(gaps, ensure_ascii=False) +
+                    "。请只依据已有餐厅来源补齐每天两家不同门店的午餐和晚餐，观光行程必须为每天匹配一个不同景点，不能将同一景点用于多天凑数。"
                     "每餐至少30分钟，安排不能重叠或落在已知闭馆/午休时间。价格可未知，不新增无来源门店。"
                     "重新输出完整行程JSON，不能调用工具。"})
                 continue
@@ -539,7 +535,7 @@ async def _generate_segment(request, adapters, evidence, messages, allow_repair,
             if meal_fallback is not None and exc.code == "INVALID_MODEL_OUTPUT":
                 # This is a validated live draft, never synthetic/demo fallback.
                 saved, saved_warnings = meal_fallback
-                return saved, True, saved_warnings + ["餐厅补充输出未通过校验，保留此前已验证的真实行程；餐次缺口仍需确认。"]
+                return saved, True, saved_warnings + (["覆盖修复输出未通过校验，保留此前核心字段有效的草稿，最终仍需通过覆盖检查。"] if coverage_required else ["餐厅补充输出未通过校验，保留此前已验证的真实行程；餐次缺口仍需确认。"])
             if hasattr(exc, "validation_reason"):
                 logger.warning("request_id=%s error_code=INVALID_MODEL_OUTPUT phase=ITINERARY_VALIDATION check=%s fields=%s counts=%s",
                                adapters.budget.request_id, exc.validation_reason, exc.validation_field, adapters.budget.counts)

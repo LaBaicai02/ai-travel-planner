@@ -74,6 +74,33 @@ class TripCoverageTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(mode=mode),self.assertRaises(ProviderError) as caught:
                 await self.execute(fixture)
             self.assertEqual(caught.exception.code,'ITINERARY_COVERAGE_MISSING')
+            self.assertIn('不同景点' if mode == 'repeat' else '午餐', caught.exception.message)
+            self.assertEqual(len([b for _,b in fixture.requests if 'response_format' in b]), 2)
+
+    async def test_repeated_sights_repaired_using_existing_allowance(self):
+        fixture = with_multi_coverage(Fixture(outputs=[segment(0,3,True), segment(0,3,True)]))
+        original = fixture.handle
+        generated = [0]
+        def handle(request):
+            response = original(request)
+            if 'response_format' in json.loads(request.content):
+                generated[0] += 1
+                if generated[0] == 1:
+                    data = response.json()
+                    output = json.loads(data['choices'][0]['message']['content'])
+                    for day in output['days']:
+                        day['activities'][0]['place_id'] = 'place_1'
+                    data['choices'][0]['message']['content'] = json.dumps(output)
+                    return httpx.Response(200, json=data)
+            return response
+        fixture.handle = handle
+        trip, budget = await self.execute(fixture)
+        self.assertEqual(len({day.activities[0].location for day in trip.days}), 3)
+        self.assertEqual(budget.counts['model_calls'], 3)
+        self.assertEqual(budget.counts['search_calls'], 2)
+        repaired = [body for _, body in fixture.requests if 'response_format' in body][-1]
+        self.assertTrue(any('missing_independent_sight_days' in (message.get('content') or '')
+                            for message in repaired['messages']))
 
     async def test_search_budget_and_low_time_stop_before_paid_generation(self):
         for limit,low_time in [(1,False),(6,True)]:
