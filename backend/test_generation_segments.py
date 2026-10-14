@@ -7,6 +7,7 @@ from decimal import Decimal
 import httpx
 from backend.agent import generate_live
 from backend.providers import CallBudget, ProviderError, ServiceAdapters
+from backend.test_coverage_support import with_multi_coverage
 from backend.test_agent import Fixture, REQUEST, SETTINGS
 
 
@@ -25,6 +26,8 @@ def segment(offset, count, known=False):
 class SegmentTests(unittest.IsolatedAsyncioTestCase):
     async def run_fixture(self, fixture, days=14, settings=SETTINGS, budget=None):
         budget = budget or CallBudget(settings)
+        if days > 1:
+            fixture = with_multi_coverage(fixture)
         async with httpx.AsyncClient(transport=httpx.MockTransport(fixture.handle)) as client:
             trip = await generate_live(REQUEST.model_copy(update={'days':days}),ServiceAdapters(settings,client,budget))
         return trip,budget
@@ -35,16 +38,16 @@ class SegmentTests(unittest.IsolatedAsyncioTestCase):
                 fixture=Fixture(outputs=[segment(i,min(5,count-i),True) for i in range(0,count,5)])
                 trip,budget=await self.run_fixture(fixture,days=count)
                 self.assertEqual([d.day for d in trip.days],list(range(1,count+1)))
-                self.assertEqual(trip.total_cost,Decimal(160*count))
+                self.assertEqual(trip.total_cost,Decimal(200*count))
                 self.assertEqual(budget.counts['model_calls'],(count+4)//5+1 if count>10 else (count+4)//5+2)
-                self.assertEqual(budget.counts['search_calls'],1)
-                self.assertTrue(any('重复地点' in w for w in trip.warnings) if count>1 else True)
+                self.assertEqual(budget.counts['search_calls'],2)
+                self.assertFalse(any('尚未达到每天至少两家餐厅' in w for w in trip.warnings))
                 generations=[b for _,b in fixture.requests if 'response_format' in b]
                 for i,b in enumerate(generations):
                     instruction=json.loads(b['messages'][-1]['content'])
                     self.assertEqual(instruction['segment_request']['days'],min(5,count-i*5))
                     self.assertEqual(instruction['segment_request']['departure_date'],(REQUEST.departure_date+timedelta(days=i*5)).isoformat())
-                    self.assertEqual(instruction['previous_place_ids'],[] if i==0 else ['place_1'])
+                    self.assertEqual(len(instruction['previous_place_ids']),0 if i==0 else i*5+2)
                     self.assertNotIn('tools',b)
 
     async def test_small_budget_rejected_before_paid_search(self):

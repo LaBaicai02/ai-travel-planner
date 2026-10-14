@@ -33,3 +33,24 @@ test('页面通过真实后端 Agent 和 HTTP mock 生成行程，失败保留�
   await expect(page.locator('.stale-result')).toContainText('上次成功结果')
   await expect(page.locator('.day-card')).toHaveCount(1)
 })
+
+
+test('多日候选不足明确失败，不展示重复行程，调整为一天后可恢复', async ({ page }) => {
+  await page.route('**/api/**', async route => {
+    const path = new URL(route.request().url()).pathname
+    const response = await route.fetch({ url: `${backend}/live${path}` })
+    await route.fulfill({ response })
+  })
+  await page.goto('/')
+  await expect(page.getByRole('button', { name: '生成我的行程' })).toBeEnabled()
+  await page.locator('#destination').fill('杭州')
+  await page.locator('#days').fill('3')
+  await page.getByRole('button', { name: '生成我的行程' }).click()
+  await expect(page.getByRole('alert')).toContainText('INSUFFICIENT_EVIDENCE')
+  await expect(page.getByRole('alert')).toContainText('候选覆盖不足')
+  await expect(page.locator('.day-card')).toHaveCount(0)
+  await page.locator('#days').fill('1')
+  await page.getByRole('button', { name: '生成我的行程' }).click()
+  await expect(page.locator('.day-card')).toHaveCount(1)
+  await expect(page.locator('.activity')).toContainText('建议前往西湖')
+})

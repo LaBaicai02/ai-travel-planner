@@ -8,6 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model, model_validator
 
+from backend.trip_coverage import supplement_coverage, require_candidates, coverage_counts, deficits, distinct_daily_choices
 from backend.place_candidates import explicit_names
 from backend.prompts import SYSTEM, SEARCH_POLICY, OUTPUT_RULES, GENERATION_EXAMPLES
 from backend.providers import ProviderError, ServiceAdapters
@@ -225,6 +226,7 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
                 {"role": "user", "content": json.dumps(request.model_dump(mode="json"), ensure_ascii=False)}]
     evidence, warnings, seen_calls = {}, [], set()
     source_purposes = {}
+    coverage_attempted = set()
     generation_reserve = min(settings.llm_timeout_seconds * (chunk_count + 1),
                              settings.trip_timeout_seconds * 0.6)
     for round_index in range(min(settings.max_search_rounds, settings.max_model_calls - chunk_count - 1,
@@ -249,7 +251,9 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
                 arguments = SearchArguments.model_validate(call.arguments)
                 if not arguments.query.strip():
                     raise ValueError
-                if budget.counts["search_calls"] >= settings.max_search_calls:
+                if request.days > 1 and arguments.purpose == "price" and any(deficits(request, _place_catalog(request, evidence), source_purposes).values()):
+                    payload = {"error": "COVERAGE_FIRST", "message": "先补齐景点及餐厅覆盖，再检索价格。"}
+                elif budget.counts["search_calls"] >= settings.max_search_calls:
                     payload = {"error": "SEARCH_CALL_LIMIT", "message": "搜索次数已用完。"}
                 elif evidence and budget.remaining() < generation_reserve + settings.search_timeout_seconds + 1:
                     payload = {"error": "SEARCH_TIME_RESERVED", "message": "剩余时间已预留给行程生成与校验，不再执行本次搜索。"}
@@ -282,6 +286,8 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
                 payload = {"error": exc.code, "message": exc.message}
             messages.append({"role": "tool", "tool_call_id": call.id,
                              "content": json.dumps(payload, ensure_ascii=False)})
+        if request.days > 1:
+            await supplement_coverage(request, adapters, evidence, source_purposes, messages, warnings, _place_catalog, coverage_attempted)
         if budget.counts["search_calls"] >= settings.max_search_calls:
             warnings.append("已达到搜索次数上限，行程仅依据本次已获取资料。")
             break
@@ -292,6 +298,7 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
         logger.warning("request_id=%s error_code=INSUFFICIENT_EVIDENCE phase=CANDIDATE_EXTRACTION evidence_count=%s candidate_count=0 counts=%s",
                        budget.request_id, len(evidence), budget.counts)
         raise ProviderError("search", "INSUFFICIENT_EVIDENCE", "搜索结果未形成可用的具体地点候选，已停止生成；请调整检索条件。", True)
+    require_candidates(request, catalog, source_purposes, budget)
     combined, repair_used = [], False
     for offset in range(0, request.days, 5):
         part = request.model_copy(update={"days": min(5, request.days - offset),
@@ -315,7 +322,28 @@ async def generate_live(request: TripRequest, adapters: ServiceAdapters) -> Trip
     classifications = _classifications(GeneratedTrip(days=combined))
     trip = improve_schedule(trip, source_purposes, classifications)
     trip = annotate_plan(trip, source_purposes, any(i != "地道美食" for i in request.interests), classifications)
-    return await complete_online_prices(trip, evidence, adapters)
+    if request.days > 1:
+        attraction_ids, restaurant_ids = coverage_counts(catalog, source_purposes)
+        restaurant_names = {catalog[pid]["name"] for pid in restaurant_ids}
+        meal_classes = {key: value for key, value in classifications.items()}
+        for day in trip.days:
+            for index, activity in enumerate(day.activities):
+                if activity.location not in restaurant_names:
+                    meal_classes[(day.day, index)] = ("other", None)
+        meal_missing = meal_gaps(trip, source_purposes, meal_classes)
+        attraction_names = {catalog[pid]["name"] for pid in attraction_ids}
+        needs_sights = any(i != "地道美食" for i in request.interests)
+        daily_sights = [{a.location for i, a in enumerate(d.activities) if a.location in attraction_names
+                         and classifications.get((d.day, i), (None, None))[0] == "sightseeing"} for d in trip.days]
+        if meal_missing or (needs_sights and not distinct_daily_choices(daily_sights)):
+            logger.warning("request_id=%s error_code=ITINERARY_COVERAGE_MISSING phase=FINAL_COVERAGE counts=%s", budget.request_id, budget.counts)
+            raise ProviderError("model", "ITINERARY_COVERAGE_MISSING", "生成结果未达到多日行程最低覆盖：每天需午晚餐两家餐厅，观光行程每天需不同景点。已停止返回重复或缺餐的行程，请核对搜索覆盖与预算。", True)
+    trip = await complete_online_prices(trip, evidence, adapters)
+    # Preserve internal activity intent through price checks, then render neutral text.
+    for day in trip.days:
+        for activity in day.activities:
+            activity.description = f'建议前往{activity.location}；具体体验、开放及预约要求请以来源和现场确认为准。'
+    return trip
 
 
 def _repair_issues(output: GeneratedTrip, request: TripRequest, evidence: dict,

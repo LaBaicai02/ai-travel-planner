@@ -107,6 +107,9 @@ def mutate(field, value):
 class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def execute(self, fixture, settings=SETTINGS, request=REQUEST):
         budget = CallBudget(settings)
+        if request.days > 1:
+            from backend.test_coverage_support import with_multi_coverage
+            fixture = with_multi_coverage(fixture)
         async with httpx.AsyncClient(transport=httpx.MockTransport(fixture.handle)) as client:
             trip = await generate_live(request, ServiceAdapters(settings, client, budget))
         return trip, budget
@@ -229,7 +232,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             return output
         trip,_=await self.execute(Fixture(outputs=[days]),request=REQUEST.model_copy(update={'days':2}))
         self.assertEqual(len(trip.days),2)
-        self.assertEqual(len(trip.days[0].activities),1)
+        self.assertEqual(len(trip.days[0].activities),3)
 
     async def test_fourteen_days_complete_or_error_never_shortened(self):
         def segment(offset, count):

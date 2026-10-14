@@ -113,7 +113,7 @@ def create_app(settings: Settings | None = None, *, transport=None) -> FastAPI:
                                request_id, provider, getattr(exc, "elapsed_ms", "unknown"), getattr(exc, "call_counts", {}))
             if exc.code == "TOTAL_TIMEOUT":
                 phase = getattr(exc, "phase", "unknown")
-                if phase not in {"STARTING", "SEARCH_DECISION", "TRAVEL_SEARCH", "ITINERARY_GENERATION", "ITINERARY_REPAIR", "PRICE_SEARCH"}:
+                if phase not in {"STARTING", "SEARCH_DECISION", "TRAVEL_SEARCH", "COVERAGE_SEARCH", "ITINERARY_GENERATION", "ITINERARY_REPAIR", "PRICE_SEARCH"}:
                     phase = "unknown"
                 logger.warning("request_id=%s error_code=TOTAL_TIMEOUT phase=%s elapsed_ms=%s counts=%s",
                                request_id, phase, getattr(exc, "elapsed_ms", "unknown"), getattr(exc, "call_counts", {}))
